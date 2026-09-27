@@ -1,0 +1,30 @@
+{
+  "rgb_serial": "352122273221",
+  "tracking_serial": "",
+  "resolution": [640, 480],
+  "fps": 30,
+  "task": "Describe the manipulation task",
+  "T_tracker_tcp": null,
+  "calibration_verified": false,
+  "timing_verified": false,
+  "camera_time_offset_s": 0.0,
+  "warmup_s": 2.0,
+  "max_clock_jitter_s": 0.015,
+  "max_image_skew_s": 0.012,
+  "max_pose_gap_s": 0.025,
+  "min_tracker_confidence": 3,
+  "max_speed_m_s": 2.0,
+  "max_angular_speed_rad_s": 12.0,
+  "max_width_speed_m_s": 0.4,
+  "markers": {
+    "dictionary": "DICT_4X4_50",
+    "ids": [13, 14],
+    "size_m": null,
+    "min_side_px": 16,
+    "max_reprojection_px": 1.0,
+    "max_ambiguity_m": 0.002,
+    "width_gain": null,
+    "width_offset_m": null,
+    "width_range_m": [0.0, 0.10]
+  }
+}
