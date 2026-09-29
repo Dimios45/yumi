@@ -1,0 +1,10 @@
+{
+  "initial_joints_rad": null,
+  "T_capture_tcp_robot_tool": null,
+  "workspace_m": null,
+  "max_joint_speed_rad_s": 0.5,
+  "max_joint_accel_rad_s2": 2.0,
+  "gripper": {"widths_m": [], "native_open_commands": []},
+  "hardware_verified": false,
+  "notes": "Fill with measured robot state, registered tool-axis transform, workspace bounds [min_xyz,max_xyz], and measured gripper mapping. Do not assume the capture and robot TCP axes coincide. This template deliberately has no invented physical calibration."
+}

@@ -4,6 +4,11 @@
 
 A local, uv-managed capture and calibration toolkit with Viser preview and an official **LeRobot v3.0** exporter. It uses the T265's onboard visual–inertial pose estimate, D405 RGB/depth, and two finger ArUco markers. It does not drive robot hardware.
 
+**Single-arm Karma/YAM workflow:** [capture, relative action export and offline robot feasibility](docs/single-arm-umi.md).
+The latest three-episode batch has no valid jaw-width labels because marker 13
+was not decoded. Fix that before collecting more training demonstrations. The
+recorder now requires valid width as well as tracking before an episode starts.
+
 **Status:** real D405 RGB/depth capture and Viser startup tested here; synthetic two-episode LeRobot export and full readback passed. T265 pose/IMU streaming and an overhead D435 snapshot are now tested; physical calibration remains pending. Marker scale, jaw geometry, tool extrinsics, timing, and physical tracking accuracy are not yet calibrated. Do not mark the example calibration verified until those measurements are complete. See [validation](docs/validation.md).
 
 ## Compatibility
@@ -28,7 +33,7 @@ Sources: [RealSense 2.53.1 release](https://github.com/realsenseai/librealsense/
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/) if unavailable, then:
 
 ```bash
-cd /home/yambox/yumi
+cd ~/yumi
 uv sync --locked --extra dev
 uv sync --locked --project exporter --python /usr/bin/python3.10
 ```
@@ -59,11 +64,87 @@ If a legacy wheel cannot access your kernel's video backend, a source build with
 
 ## Calibrate, capture, convert
 
-On this machine, `configs/umi.local.json` already contains the device serials, 10 mm marker size and image-space opening mode; see [marker troubleshooting](docs/marker-troubleshooting.md). For a new setup, copy `configs/umi.example.json` to `configs/umi.local.json`. Fill in the T265 serial and follow [the calibration procedure](docs/calibration.md). The example deliberately has null scale/extrinsics and false verification flags.
+`configs/umi.local.json` is ignored by Git and **does not exist in a fresh checkout**. Create it before running any command with `--config`. The following uses the previously tested handheld serials and 10 mm finger markers; confirm serials with `devices` and replace them if your hardware differs. Measure each marker's outer black square and update `markers.size_m` in metres if needed.
 
-1. **Measure marker black-square size** in metres, jaw openings, and tool extrinsics.
-2. **Calibrate timing** using a stationary printed board and varied rotations.
-3. **Validate repeatability**, marker error across the aperture range, and timing under actual capture load.
+```bash
+cd ~/yumi
+uv run --locked yumi devices
+uv run --locked python - <<'PYCONFIG'
+import json
+from pathlib import Path
+
+path = Path("configs/umi.local.json")
+if path.exists():
+    print(f"Keeping existing {path}; check its serials and marker settings.")
+else:
+    config = json.loads(Path("configs/umi.example.json").read_text())
+    config["rgb_serial"] = "352122273221"
+    config["tracking_serial"] = "943222111495"
+    config["markers"]["size_m"] = 0.010
+    config["markers"]["width_method"] = "image_calibrated"
+    with path.open("x") as f:
+        json.dump(config, f, indent=2)
+        f.write("\n")
+    print(f"Created {path}; physical calibration is still required.")
+PYCONFIG
+```
+
+This creates an **unverified starting config**, with no fitted jaw model or tool transform. Keep an existing calibrated config instead of overwriting it. The historical local settings mentioned in the [Print & Calibration Guide](CALIBRATION_PRINT_GUIDE.md) and troubleshooting notes are not bundled with a fresh checkout.
+
+**Calibrate jaw opening.** Only one process can use the D405 at a time. Stop any recording or preview first. The live server requires `markers.width_method` to be `image_calibrated` (set above):
+
+```bash
+uv run --locked yumi calibrate-width-live --config configs/umi.local.json \
+  --samples data/calibration/width-live.json
+```
+
+Open **http://127.0.0.1:8080**. In a second terminal on the capture computer:
+
+```bash
+cd ~/yumi
+uv run --locked yumi width-console
+```
+
+Hold a physically measured inner jaw gap steady, wait for **READY**, then type its actual value in millimetres and press Enter. Collect at least six distinct measured openings spanning at least 20 mm and covering the usable travel. Set `markers.width_range_m` to your physical travel limits. Keep separate measured openings for validation. Use a new samples filename when recalibrating after a mounting or resolution change.
+
+Type `q` to exit the console, then **Ctrl+C in the server terminal** to release the camera. Fit the samples and save the result:
+
+```bash
+uv run --locked yumi fit-width --samples data/calibration/width-live.json \
+  > data/calibration/width-fit.json
+```
+
+Proceed only if the fit succeeds. It rejects maximum training error above 1 mm by default. Review the result, then install its jaw model in the local config:
+
+```bash
+uv run --locked python - <<'PYCONFIG'
+import json
+from pathlib import Path
+
+path = Path("configs/umi.local.json")
+config = json.loads(path.read_text())
+fit = json.loads(Path("data/calibration/width-fit.json").read_text())
+config["markers"]["width_method"] = fit["width_method"]
+config["markers"]["image_width_calibration"] = fit["image_width_calibration"]
+config["calibration_verified"] = False
+path.write_text(json.dumps(config, indent=2) + "\n")
+PYCONFIG
+```
+
+Validate displayed opening at held-out measured gaps using `uv run --locked yumi preview-markers --config configs/umi.local.json`; stop it before the next capture. See [marker troubleshooting](docs/marker-troubleshooting.md) for visibility and fit failures.
+
+**Calibrate camera/tracker geometry and timing.** Print [the stationary ID 0 target](calibration/aruco_0_100mm.svg) at actual size, measure its black square, and fix it to a rigid stationary board. During the recording below, move the handheld with varied rotations about at least two axes and some translation, keeping the board visible. Let the T265 establish confidence 3 first. Replace `0.100` with the measured board side in metres:
+
+```bash
+uv run --locked yumi record --config configs/umi.local.json \
+  --output data/calibration/board --seconds 60
+uv run --locked yumi inspect --raw data/calibration/board \
+  --config configs/umi.local.json --output data/calibration/board-audit.json
+uv run --locked yumi calibrate-board --raw data/calibration/board \
+  --marker-id 0 --size-m 0.100 --output data/calibration/board-result.json
+```
+
+Use new output paths for repeat recordings/results. Resolve frame-loss or timing-gate failures before accepting calibration. The solver saves `T_tracker_camera` and `camera_time_offset_s`; it does **not** update the local config. Copy the validated `camera_time_offset_s` into the config. Obtain `T_camera_tcp` from measured tool geometry/CAD and set the config's `T_tracker_tcp` to `T_tracker_camera @ T_camera_tcp` (4×4 matrix, translation in metres). The board cannot infer your tool contact point. Follow [tool geometry and validation](docs/calibration.md#4-define-the-tool-center-and-axes), including independent board captures and fixed-tip checks. Set `calibration_verified` and `timing_verified` true only after the physical spatial and timing checks pass. There is no single command that supplies all physical measurements automatically.
 
 A camera-only diagnostic works before calibration (cannot become a tracked demonstration):
 
@@ -71,13 +152,13 @@ A camera-only diagnostic works before calibration (cannot become a tracked demon
 uv run yumi record --config configs/umi.local.json --output data/camera-check --seconds 15 --camera-only
 ```
 
-A tracked episode, after setting serials:
+A tracked demonstration, after completing and validating calibration:
 
 ```bash
 uv run yumi record --config configs/umi.local.json --output data/raw/episode-000 --seconds 30
 ```
 
-Open **http://127.0.0.1:8080** during capture. Viser binds to `0.0.0.0`; on another laptop on this LAN, open `http://192.168.0.187:8080` (or the host’s current LAN address). Viser shows RGB, marker diagnostics when scale is supplied, and latest tracker/tool pose. The preview is not the synchronized export. Capture ends at the requested duration or Ctrl+C; each command creates a new episode directory. Keep the first two seconds for initialization. Use `--no-viewer` for capture without a browser server.
+Open **http://127.0.0.1:8080** during capture. Viser binds to `0.0.0.0`; on another laptop on this LAN, open `http://192.168.0.187:8080` (or the host’s current LAN address). Viser shows RGB, marker diagnostics when scale is supplied, and latest tracker/tool pose. The preview is not the synchronized export. Capture ends at the requested duration or Ctrl+C; each command creates a new episode directory. This single-episode command restarts devices; two seconds of processing warmup does not guarantee tracker confidence. Use persistent sessions below for repeated collection. Use `--no-viewer` for capture without a browser server.
 
 ```bash
 uv run yumi prepare --raw data/raw/episode-000 --calibration configs/umi.local.json --output data/prepared/episode-000.json
@@ -92,7 +173,64 @@ Pass multiple prepared JSON files to `--manifests` for multiple episodes. No aut
 
 A prepare failure identifies an episode requiring correction/recollection. Missing markers, tracking loss, repeated images, pose jumps, excessive width speed, clock resets, and timestamp gaps are not silently filled. Keep raw recordings; all calibration/processing is repeatable.
 
-## Saved data and action semantics
+## Persistent episode sessions (LeRobot v3)
+
+Use `record-session` to open the D405, T265 and Viser **once**, warm up tracking,
+then start each episode from the terminal. Install the isolated official v3
+writer once (its NumPy version differs from the camera SDK environment):
+
+```bash
+uv sync --project exporter --locked
+uv run --locked yumi record-session \
+  --config configs/umi.local.json \
+  --output "data/lerobot/session-$(date +%Y%m%d-%H%M%S)" \
+  --episodes 3 --seconds 30 --warmup 30 \
+  --task "Pick up the block and place it in the container"
+```
+
+Use your intended calibrated or explicitly provisional config. A session never
+sets calibration/timing verification flags to true. Open **http://localhost:8080**
+and keep it open. During the initial 30 seconds, move gently so tracking can
+initialize. Thirty seconds is a minimum warmup, not a promise of confidence.
+At each prompt, press **Enter** to start; starting requires fresh RGB and fresh
+tracking confidence 3/3 and valid jaw width sustained for one second. If not ready, wait and press
+Enter again. Devices and the browser remain live during warmup, saving and resets;
+only active episode samples are saved. Each episode ends at `--seconds`.
+
+- **Ctrl+C while recording:** finish and save the shortened episode, then prompt
+  for the next one. It counts toward `--episodes` if it contains RGB frames.
+- **q + Enter, or Ctrl+C at the ready prompt:** finalize the dataset and exit.
+- Tracking loss during an episode is recorded in quality fields, not silently
+  removed or presented as valid. Writer/sensor failures mark the session failed.
+- A conservative free-space check runs before each episode. Use a new output
+  directory for every session; existing datasets are never overwritten.
+
+The result is an **official LeRobot v3 raw-observation dataset**: `meta/`, parquet
+`data/`, and RGB MP4 `videos/`. `extras/episode_*/` retains full-rate pose/IMU and
+sensor timestamps plus losslessly compressed native Z16 depth (`.npz`, key
+`depth`). `session.json` documents capture configuration and semantics. Detailed
+encoder logs go to the adjacent `*.writer.log`, keeping the terminal readable.
+
+This capture schema deliberately has **no `action` feature**. Its
+`observation.state` is a provisional TCP pose in the persistent T265 session frame
+and aperture in metres, paired with the last received pose, not a claimed
+synchronized training label. `observation.quality` contains tracking confidence,
+pose-valid and width-valid flags, and image-minus-pose time. Missing width uses
+zero with `width_valid=0`; missing pose uses identity with `pose_valid=0`.
+`observation.sensor_time` preserves real device/host times independently of
+LeRobot's nominal FPS timestamps. Do not train on invalid placeholders.
+
+Use the [single-arm UMI workflow](docs/single-arm-umi.md) for synchronized relative
+action chunks, official LeRobot v3 export and offline YAM IK feasibility. Physical
+calibration/timing verification and a matching policy/runtime remain necessary.
+The legacy `yumi prepare` and `export_dataset.py verify` commands below target the
+older raw/8D next-action pipeline, **not this session observation schema**. Use the
+official LeRobot loader to inspect session datasets. `yumi prepare-session` now
+constructs gated training chunks separately from capture; `yumi plan-robot` checks
+one chunk offline against the pinned Karma/YAM model. `COMPLETE` means
+capture finalized, not calibration or policy-readiness verification.
+
+## Legacy raw capture and action semantics
 
 - Raw `rgb/*.png`: original RGB, lossless. Raw `depth/*.npy`: native, unaligned `uint16` Z16. Multiply by `depth_scale_m` from metadata for metres. Depth and color intrinsics/extrinsics are recorded separately.
 - `samples.jsonl`: full-rate T265 poses/confidences/velocities and accel/gyro, independent RGB and depth device timestamps, frame numbers, host monotonic arrival timestamps, timestamp domains.
@@ -102,7 +240,11 @@ A prepare failure identifies an episode requiring correction/recollection. Missi
 - `observation.capture_time` and `observation.quality` preserve real timing and measurement diagnostics alongside LeRobot's nominal FPS timestamps.
 - Dataset `extras/episode_*/`: lossless depth, full-rate pose/IMU log, metadata, and prepared manifest. Depth is deliberately **not** encoded into lossy RGB video. Extras are not loaded automatically as policy observation tensors.
 
-This is valid LeRobot storage, but an 8D Cartesian action schema needs a matching policy configuration and robot-side calibrated Cartesian controller. Relative-action/6D-rotation adapters, bimanual collection, robot retargeting, and absolute external-world anchoring are not included. The D435 is not needed for the single-handheld pipeline.
+This legacy 8D schema differs from the new session processor's relative 10D
+action-chunk contract. Do not mix their labels or policy configurations. Neither
+format includes a trained policy or validated hardware controller. Bimanual
+collection and absolute external-world anchoring remain outside this single-arm
+path. The D435 is not needed for the single-handheld pipeline.
 
 ## Software verification
 

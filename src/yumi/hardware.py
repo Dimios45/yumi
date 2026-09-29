@@ -75,7 +75,9 @@ def snapshot(serial, output):
         p.stop()
 
 
-def record(config, output, seconds, visualize=True, port=8080, tracking=True):
+def record(
+    config, output, seconds, visualize=True, port=8080, tracking=True, session=None
+):
     """Lossless raw episode, independent sensor polling threads and bounded writer queue.
 
     A COMPLETE marker is created only after orderly shutdown and all writes.
@@ -85,9 +87,10 @@ def record(config, output, seconds, visualize=True, port=8080, tracking=True):
         raise ValueError("seconds must be positive")
     rs = sdk()
     root = Path(output)
-    root.mkdir(parents=True, exist_ok=False)
-    (root / "rgb").mkdir()
-    (root / "depth").mkdir()
+    if session is None:
+        root.mkdir(parents=True, exist_ok=False)
+        (root / "rgb").mkdir()
+        (root / "depth").mkdir()
     q = queue.Queue(maxsize=256)
     stop = threading.Event()
     errors = queue.Queue()
@@ -103,6 +106,9 @@ def record(config, output, seconds, visualize=True, port=8080, tracking=True):
     }
 
     def put(item):
+        if session is not None:
+            session.accept(item)
+            return
         try:
             q.put(item, timeout=0.5)
         except queue.Full as e:
@@ -169,6 +175,7 @@ def record(config, output, seconds, visualize=True, port=8080, tracking=True):
                 }
                 with lock:
                     latest["rgb"] = rgb
+                    latest["rgb_arrival_s"] = item["arrival_s"]
             elif frame.profile.stream_type() == rs.stream.depth:
                 item |= {
                     "kind": "depth",
@@ -300,9 +307,14 @@ def record(config, output, seconds, visualize=True, port=8080, tracking=True):
                 rs.camera_info.firmware_version
             )
             worker_fns.append(lambda: pose_loop(tp))
-        (root / "metadata.json").write_text(json.dumps(meta, indent=2))
-        writer_thread = threading.Thread(target=lambda: guarded(writer), daemon=True)
-        writer_thread.start()
+        if session is None:
+            (root / "metadata.json").write_text(json.dumps(meta, indent=2))
+            writer_thread = threading.Thread(
+                target=lambda: guarded(writer), daemon=True
+            )
+            writer_thread.start()
+        else:
+            session.setup(meta)
         camera_sensor.start(video_callback)
         camera_started = True
         for fn in worker_fns:
@@ -313,12 +325,15 @@ def record(config, output, seconds, visualize=True, port=8080, tracking=True):
             from .viewer import Viewer
 
             viewer = Viewer(config, meta["rgb_intrinsics"], port)
-        end = time.monotonic() + seconds
-        while time.monotonic() < end and not stop.wait(0.05):
-            if viewer:
-                with lock:
-                    current = latest.copy()
-                viewer.update(current)
+        if session is not None:
+            session.run(latest, lock, viewer, stop)
+        else:
+            end = time.monotonic() + seconds
+            while time.monotonic() < end and not stop.wait(0.05):
+                if viewer:
+                    with lock:
+                        current = latest.copy()
+                    viewer.update(current)
     except KeyboardInterrupt:
         pass
     except Exception as e:  # noqa: BLE001 — propagate worker/shutdown failures to caller
@@ -349,13 +364,24 @@ def record(config, output, seconds, visualize=True, port=8080, tracking=True):
             writer_thread.join(timeout=30)
             if writer_thread.is_alive():
                 errors.put(RuntimeError("Writer shutdown timed out"))
+        if session is not None:
+            try:
+                session.close(
+                    None
+                    if errors.empty()
+                    else RuntimeError("Capture failed; see FAILED.txt")
+                )
+            except Exception as e:  # noqa: BLE001 — propagate shutdown failures
+                errors.put(e)
         if viewer:
             viewer.close()
     if not errors.empty():
         error = errors.get()
-        (root / "FAILED.txt").write_text(str(error))
+        if root.exists():
+            (root / "FAILED.txt").write_text(str(error))
         raise error
-    (root / "COMPLETE").write_text(
-        "Raw capture closed successfully; not yet quality validated.\n"
-    )
+    if session is None:
+        (root / "COMPLETE").write_text(
+            "Raw capture closed successfully; not yet quality validated.\n"
+        )
     return root

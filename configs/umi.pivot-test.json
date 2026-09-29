@@ -1,0 +1,168 @@
+{
+  "rgb_serial": "352122273221",
+  "tracking_serial": "943222111495",
+  "resolution": [
+    640,
+    480
+  ],
+  "fps": 30,
+  "task": "Fixed-tip pivot calibration test: initial tracking acquisition, then closed jaw-tip midpoint held at one stationary point while rotating about multiple axes.",
+  "T_tracker_tcp": [
+    [
+      1.0,
+      0.0,
+      0.0,
+      0.009099999963042754
+    ],
+    [
+      0.0,
+      -0.9063077870366499,
+      0.42261826174069944,
+      -0.07344940010132656
+    ],
+    [
+      0.0,
+      -0.42261826174069944,
+      -0.90630778703665,
+      -0.10757286818428333
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "calibration_verified": false,
+  "timing_verified": false,
+  "camera_time_offset_s": -0.03199999999999999,
+  "warmup_s": 2.0,
+  "max_clock_jitter_s": 0.015,
+  "max_image_skew_s": 0.012,
+  "max_pose_gap_s": 0.025,
+  "min_tracker_confidence": 3,
+  "max_speed_m_s": 2.0,
+  "max_angular_speed_rad_s": 12.0,
+  "max_width_speed_m_s": 0.4,
+  "markers": {
+    "dictionary": "DICT_4X4_50",
+    "ids": [
+      13,
+      14
+    ],
+    "size_m": 0.01,
+    "min_side_px": 16,
+    "max_reprojection_px": 1.0,
+    "max_ambiguity_m": 0.002,
+    "width_gain": null,
+    "width_offset_m": null,
+    "width_range_m": [
+      0.0,
+      0.1
+    ],
+    "width_method": "image_calibrated",
+    "image_width_calibration": {
+      "gain_m_per_px": 0.00017595147657472587,
+      "offset_m": -0.011783196031135777,
+      "separation_range_px": [
+        68.2346897437342,
+        397.49477962096347
+      ],
+      "resolution": [
+        640,
+        480
+      ],
+      "rms_m": 0.0006117006276747691,
+      "max_training_error_m": 0.0008634352669692827,
+      "accepted_fit_error_limit_m": 0.001,
+      "validation_status": "fit_only_not_independently_validated"
+    }
+  },
+  "T_tracker_camera": [
+    [
+      0.9999977847247667,
+      0.0018070188204061819,
+      -0.0011022385361112437,
+      9.012650158207562e-05
+    ],
+    [
+      0.001806348376803031,
+      -0.9999981544912231,
+      -0.0006088926180778153,
+      -0.039990011961703056
+    ],
+    [
+      -0.0011033368296753789,
+      0.000606900226439085,
+      -0.9999991891797173,
+      -0.013339995144585576
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "board_calibration": {
+    "status": "provisional_user_selected",
+    "source": "data/calibration/board-attempt2-20260928-213742/segment-calibration-diagnostics.json",
+    "start_s": 40,
+    "end_s": 70,
+    "board_size_m": 0.095,
+    "board_position_rms_m": 0.0014261077732812713,
+    "correlation": 0.9109090742566469,
+    "note": "Selected for continuation; independent segment differed by 74.6 mm and 3.9 degrees. Timing and spatial accuracy not verified. In this candidate, spatial transforms are replaced by nominal CAD; time offset remains inherited."
+  },
+  "T_camera_tcp": [
+    [
+      0.9999977350234986,
+      -0.0011708173793138683,
+      0.001763358579645374,
+      0.009053384337743104
+    ],
+    [
+      0.001807018765248358,
+      0.9060496793009412,
+      -0.4231675444680189,
+      0.033418419365253034
+    ],
+    [
+      -0.0011022385442629457,
+      0.423169778416807,
+      0.9060497556231448,
+      0.09424324216793697
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "tool_geometry": {
+    "status": "corrected_video_informed_nominal_not_validated",
+    "source": "artifacts/cad-registration/corrected-registration-result.json",
+    "tcp_definition": "TCP is midpoint of CAD distal tip ends. Export labels their placement illustrative; actual pressure contact centroid and motion with jaw opening are not registered.",
+    "camera_downward_pitch_deg": 25.0,
+    "assumptions": [
+      "Video establishes forward orientation but does not measure hidden contact-plane clearance; +4 mm assembly translation assumes flush holder/base mating.",
+      "Forward adapter/D405 seating is a video-informed interpretation. Supplied assembly README instead specifies adapter behind holder; that alternative is calculated explicitly.",
+      "T265 5.95 mm back-to-IMU-reference depth is used as a nominal pose PCB depth, not a verified pose-origin depth. Factory extrinsics query found no T265 device.",
+      "TCP is midpoint of CAD distal tip ends. Export labels their placement illustrative; actual pressure contact centroid and motion with jaw opening are not registered.",
+      "Nominal parallel camera optical axes and zero roll/yaw mounting error assumed; print and screw clearance tolerances are not measured.",
+      "Timing remains inherited provisional board fit; CAD cannot determine temporal offset."
+    ]
+  },
+  "spatial_calibration": {
+    "method": "video_informed_nominal_CAD",
+    "replaces_board_spatial_fit": true,
+    "verified": false
+  },
+  "pivot_test": {
+    "duration_s": 60,
+    "tracking_acquisition_s": 15,
+    "pivot_start_s": 15,
+    "instructions": "Close jaws, keep the same jaw-tip midpoint on a fixed physical point; slowly tilt in two independent directions without sliding or changing opening. Inspect actual tracking confidence before analysis."
+  }
+}

@@ -7,6 +7,16 @@ def main():
     p = argparse.ArgumentParser(description="ROS-free T265 + D405 capture")
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("devices")
+    s = sub.add_parser(
+        "plan-robot",
+        help="Offline YAM IK/feasibility for one UMI chunk; never moves hardware",
+    )
+    s.add_argument("--manifest", required=True)
+    s.add_argument("--profile", required=True)
+    s.add_argument("--karma-root", default="research/karma")
+    s.add_argument("--i2rt-root", default="research/i2rt")
+    s.add_argument("--sample-index", type=int, default=0)
+    s.add_argument("--output", required=True)
     s = sub.add_parser("snapshot")
     s.add_argument("--serial", required=True)
     s.add_argument("--output", required=True)
@@ -17,6 +27,29 @@ def main():
     s.add_argument("--no-viewer", action="store_true")
     s.add_argument("--camera-only", action="store_true")
     s.add_argument("--port", type=int, default=8080)
+    s = sub.add_parser(
+        "record-session", help="Keep devices running; save prompted LeRobot v3 episodes"
+    )
+    s.add_argument("--config", required=True)
+    s.add_argument("--output", required=True)
+    s.add_argument("--episodes", type=int, default=3)
+    s.add_argument("--seconds", type=float, default=30)
+    s.add_argument("--warmup", type=float, default=30)
+    s.add_argument("--task", required=True)
+    s.add_argument("--repo-id", default="local/yumi-session")
+    s.add_argument("--port", type=int, default=8080)
+    s.add_argument("--no-viewer", action="store_true")
+    s = sub.add_parser(
+        "prepare-session",
+        help="Audit and synchronize LeRobot session into relative UMI chunks",
+    )
+    s.add_argument("--raw", required=True)
+    s.add_argument("--output", required=True)
+    s.add_argument("--calibration")
+    s.add_argument("--history", type=int, default=2)
+    s.add_argument("--horizon", type=int, default=16)
+    s.add_argument("--allow-provisional", action="store_true")
+    s.add_argument("--task")
     s = sub.add_parser("prepare")
     s.add_argument("--raw", required=True)
     s.add_argument("--output", required=True)
@@ -62,7 +95,18 @@ def main():
     s.add_argument("--control-port", type=int, default=8081)
     a = p.parse_args()
     try:
-        if a.command == "devices":
+        if a.command == "plan-robot":
+            from .robot_plan import make_plan
+
+            if Path(a.output).exists():
+                raise FileExistsError("Use a new plan output path")
+            plan = make_plan(
+                a.manifest, a.profile, a.karma_root, a.i2rt_root, a.sample_index
+            )
+            Path(a.output).parent.mkdir(parents=True, exist_ok=True)
+            Path(a.output).write_text(json.dumps(plan, indent=2) + "\n")
+            print(f"Offline plan: {a.output}; hardware execution disabled")
+        elif a.command == "devices":
             from .hardware import devices
 
             print(json.dumps(devices(), indent=2))
@@ -118,6 +162,31 @@ def main():
                     not a.camera_only,
                 )
             )
+        elif a.command == "record-session":
+            from .hardware import record
+            from .session import Session
+
+            c = json.loads(Path(a.config).read_text())
+            c["task"] = a.task
+            session = Session(
+                a.output, a.episodes, a.seconds, a.warmup, a.task, a.repo_id
+            )
+            print(
+                record(c, a.output, a.seconds, not a.no_viewer, a.port, True, session)
+            )
+        elif a.command == "prepare-session":
+            from .session_processing import prepare_session
+
+            c = json.loads(Path(a.calibration).read_text()) if a.calibration else None
+            result = prepare_session(
+                a.raw, a.output, c, a.history, a.horizon, a.allow_provisional, a.task
+            )
+            print(json.dumps(result, indent=2))
+            if not result["total_chunks"]:
+                p.exit(
+                    2,
+                    "No usable training chunks; inspect audit.json. Raw data preserved.\n",
+                )
         elif a.command == "prepare":
             from .processing import prepare
 
