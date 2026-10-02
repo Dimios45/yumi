@@ -1,8 +1,12 @@
 """Serial-selected RealSense acquisition; never select the first connected camera."""
 
+import contextlib
 import importlib.metadata
 import json
+import os
 import queue
+import select
+import sys
 import threading
 import time
 from pathlib import Path
@@ -75,33 +79,202 @@ def snapshot(serial, output):
         p.stop()
 
 
-def record(
-    config, output, seconds, visualize=True, port=8080, tracking=True, session=None
-):
-    """Lossless raw episode, independent sensor polling threads and bounded writer queue.
+def _write_samples(root, q):
+    with (root / "samples.jsonl").open("w") as file:
+        while True:
+            item = q.get()
+            try:
+                if item is None:
+                    break
+                if item["kind"] in ("image", "world"):
+                    rgb = item.pop("rgb")
+                    if not cv2.imwrite(
+                        str(root / item["rgb_path"]),
+                        cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+                        [cv2.IMWRITE_PNG_COMPRESSION, 1],
+                    ):
+                        raise OSError("PNG write failed")
+                elif item["kind"] == "depth":
+                    np.save(
+                        root / item["depth_path"],
+                        item.pop("depth"),
+                        allow_pickle=False,
+                    )
+                file.write(json.dumps(item, allow_nan=False) + "\n")
+            finally:
+                q.task_done()
+        file.flush()
+        os.fsync(file.fileno())
 
-    A COMPLETE marker is created only after orderly shutdown and all writes.
+
+class Episode:
+    """One raw episode directory, fed by sensor callbacks that may outlive it.
+
+    COMPLETE is written only after the writer drained and synced every sample.
+    """
+
+    def __init__(self, root, meta):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=False)
+        (self.root / "rgb").mkdir()
+        (self.root / "depth").mkdir()
+        if "world_camera" in meta:
+            (self.root / "world").mkdir()
+        (self.root / "metadata.json").write_text(
+            json.dumps(meta | {"start_unix_s": time.time()}, indent=2)
+        )
+        self.started = time.monotonic()
+        self.poses = self.low_poses = self.drops = 0
+        self.first_drop_s = self.last_confidence = None
+        self.q = queue.Queue(maxsize=256)
+        self.errors = queue.Queue()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        try:
+            _write_samples(self.root, self.q)
+        except Exception as e:  # noqa: BLE001 — surfaced by put() and close()
+            self.errors.put(e)
+
+    def put(self, item):
+        if not self.thread.is_alive():
+            raise RuntimeError("Episode writer stopped; capture aborted")
+        try:
+            self.q.put(item, timeout=0.5)
+        except queue.Full as e:
+            raise RuntimeError("Disk writer cannot keep up; capture aborted") from e
+
+    def close(self, error=None):
+        """Finish the episode; returns the error that marked it FAILED, else None."""
+        if self.thread.is_alive():
+            try:
+                self.q.put(None, timeout=5)
+            except queue.Full:
+                error = error or RuntimeError("Writer stuck")
+            self.thread.join(timeout=30)
+            if self.thread.is_alive():
+                error = error or RuntimeError("Writer shutdown timed out")
+        if error is None and not self.errors.empty():
+            error = self.errors.get()
+        if error is not None:
+            (self.root / "FAILED.txt").write_text(str(error))
+            return error
+        (self.root / "COMPLETE").write_text(
+            "Raw capture closed successfully; not yet quality validated.\n"
+        )
+        return None
+
+
+@contextlib.contextmanager
+def _keyboard(requests):
+    """Space toggles an episode, q quits. Without a TTY, each stdin line acts the same."""
+    done = threading.Event()
+    fd = sys.stdin.fileno()
+    tty_mode = sys.stdin.isatty()
+    if tty_mode:
+        import termios
+        import tty
+
+        saved = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+
+    def read():
+        while not done.is_set():
+            if not select.select([fd], [], [], 0.1)[0]:
+                continue
+            key = os.read(fd, 1) if tty_mode else sys.stdin.readline().encode()
+            if not key:
+                return
+            key = key.strip(b"\n") or b" "
+            if key[:1] == b" ":
+                requests.put("toggle")
+            elif key[:1] in (b"q", b"Q"):
+                requests.put("quit")
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    try:
+        yield
+    finally:
+        done.set()
+        reader.join(timeout=1)
+        if tty_mode:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+_CONFIDENCE = {0: ("FAILED", "41"), 1: ("LOW", "41"), 2: ("MEDIUM", "43"), 3: ("HIGH", "42")}
+
+
+def _confidence_badge(confidence, tracking=True):
+    """T265 confidence as a coloured terminal badge (green HIGH, yellow MEDIUM, red LOW)."""
+    if not tracking:
+        return "no tracker"
+    if confidence is None:
+        return "T265 starting…"
+    name, colour = _CONFIDENCE.get(confidence, ("?", "41"))
+    badge = f" T265 {confidence}/3 {name} "
+    return f"\033[1;30;{colour}m{badge}\033[0m" if sys.stdout.isatty() else badge
+
+
+def _next_episode(session):
+    taken = [
+        int(p.name.split("-")[1])
+        for p in session.glob("episode-*")
+        if p.name.split("-")[1].isdigit()
+    ]
+    return session / f"episode-{max(taken, default=-1) + 1:03d}"
+
+
+def record(
+    config,
+    output,
+    seconds=None,
+    visualize=True,
+    port=8080,
+    tracking=True,
+    session=None,
+    interactive=False,
+    world_serial=None,
+):
+    """Lossless raw episodes, independent sensor polling threads and bounded writer queues.
+
+    Non-interactive: one episode at ``output`` lasting ``seconds`` (default 30).
+    Interactive: sensors start once and stay running so the T265 can warm up;
+    space starts and stops ``output/episode-NNN`` (auto-stopping after
+    ``seconds`` if given), q quits. Samples outside an episode are not saved.
+
+    The live T265 confidence is always shown; each episode's confidence
+    statistics are saved to ``tracking.json``.
+
+    ``session`` (record-session) receives every sample and owns the episode
+    loop and storage; no raw episode directory is written.
+
+    ``world_serial`` adds a fixed external (world) RGB camera, saved as
+    ``kind: "world"`` samples under ``world/``.
+
     Queue overload aborts capture; it never silently drops a frame.
     """
-    if seconds <= 0:
+    if seconds is not None and seconds <= 0:
         raise ValueError("seconds must be positive")
+    if not interactive and seconds is None:
+        seconds = 30
     rs = sdk()
     root = Path(output)
-    if session is None:
-        root.mkdir(parents=True, exist_ok=False)
-        (root / "rgb").mkdir()
-        (root / "depth").mkdir()
-    q = queue.Queue(maxsize=256)
+    if session is None and not interactive and root.exists():
+        raise FileExistsError(f"{root} already exists")
     stop = threading.Event()
     errors = queue.Queue()
     latest = {}
     lock = threading.Lock()
+    active = {"episode": None}
+    finished = []
+    requests = queue.Queue()
     pipelines = []
     workers = []
     meta = {
         "config": config,
         "sdk_version": importlib.metadata.version("pyrealsense2"),
-        "start_unix_s": time.time(),
         "tracking": tracking,
     }
 
@@ -109,10 +282,72 @@ def record(
         if session is not None:
             session.accept(item)
             return
-        try:
-            q.put(item, timeout=0.5)
-        except queue.Full as e:
-            raise RuntimeError("Disk writer cannot keep up; capture aborted") from e
+        with lock:
+            episode = active["episode"]
+            if episode is not None and item["kind"] == "pose":
+                episode.poses += 1
+                if item["tracker_confidence"] < 3:
+                    if episode.last_confidence is None or episode.last_confidence >= 3:
+                        episode.drops += 1
+                    episode.low_poses += 1
+                    if episode.first_drop_s is None:
+                        episode.first_drop_s = item["arrival_s"] - episode.started
+                episode.last_confidence = item["tracker_confidence"]
+        if episode is not None:
+            episode.put(item)
+
+    def start_episode():
+        with lock:
+            if active["episode"] is not None:
+                return
+        path = _next_episode(root) if interactive else root
+        confidence = latest.get("pose", {}).get("tracker_confidence")
+        episode = Episode(path, meta)
+        with lock:
+            active["episode"] = episode
+        if interactive:
+            warning = (
+                ""
+                if not tracking or confidence == 3
+                else f"  WARNING: T265 confidence is {confidence}, not 3"
+            )
+            print(f"\n● REC  {path}{warning}", flush=True)
+
+    def stop_episode(error=None):
+        with lock:
+            episode, active["episode"] = active["episode"], None
+        if episode is None:
+            return
+        solid = 1 - episode.low_poses / max(episode.poses, 1)
+        if tracking:
+            (episode.root / "tracking.json").write_text(
+                json.dumps(
+                    {
+                        "pose_samples": episode.poses,
+                        "confidence_3_fraction": solid,
+                        "confidence_drops": episode.drops,
+                        "first_drop_s": episode.first_drop_s,
+                    },
+                    indent=2,
+                )
+            )
+        failure = episode.close(error)
+        finished.append(episode.root)
+        if failure is not None:
+            errors.put(failure)
+        elif interactive:
+            verdict = (
+                ""
+                if not tracking
+                else " · confidence 3 throughout ✓"
+                if episode.low_poses == 0
+                else f" · confidence 3 for {solid * 100:.0f}% ({episode.drops} drop(s))"
+            )
+            print(
+                f"\n■ saved {episode.root} "
+                f"({time.monotonic() - episode.started:.1f} s){verdict}",
+                flush=True,
+            )
 
     def guarded(fn):
         try:
@@ -120,35 +355,6 @@ def record(
         except Exception as e:  # noqa: BLE001 — propagate worker/shutdown failures to caller
             errors.put(e)
             stop.set()
-
-    def writer():
-        with (root / "samples.jsonl").open("w") as file:
-            while True:
-                item = q.get()
-                try:
-                    if item is None:
-                        break
-                    if item["kind"] == "image":
-                        rgb = item.pop("rgb")
-                        if not cv2.imwrite(
-                            str(root / item["rgb_path"]),
-                            cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
-                            [cv2.IMWRITE_PNG_COMPRESSION, 1],
-                        ):
-                            raise OSError("PNG write failed")
-                    elif item["kind"] == "depth":
-                        np.save(
-                            root / item["depth_path"],
-                            item.pop("depth"),
-                            allow_pickle=False,
-                        )
-                    file.write(json.dumps(item, allow_nan=False) + "\n")
-                finally:
-                    q.task_done()
-            file.flush()
-            import os
-
-            os.fsync(file.fileno())
 
     def stamp(frame):
         return {
@@ -226,6 +432,7 @@ def record(
                     }
                     with lock:
                         latest["pose"] = item.copy()
+
                 elif f.is_motion_frame():
                     d = f.as_motion_frame().get_motion_data()
                     item |= {
@@ -236,10 +443,28 @@ def record(
                     continue
                 put(item)
 
+    def world_loop(p):
+        last = -1
+        while not stop.is_set():
+            f = p.wait_for_frames(2000).get_color_frame()
+            if not f or f.get_frame_number() == last:
+                continue
+            last = f.get_frame_number()
+            rgb = np.asanyarray(f.get_data()).copy()
+            item = stamp(f) | {
+                "kind": "world",
+                "index": last,
+                "rgb_path": f"world/{last:08d}.png",
+                "rgb": rgb,
+            }
+            with lock:
+                latest["world"] = rgb
+            put(item)
+
     viewer = None
-    writer_thread = None
     camera_sensor = None
     camera_started = False
+    keyboard = contextlib.nullcontext()
     try:
         ctx = rs.context()
         candidates = [
@@ -307,14 +532,29 @@ def record(
                 rs.camera_info.firmware_version
             )
             worker_fns.append(lambda: pose_loop(tp))
-        if session is None:
-            (root / "metadata.json").write_text(json.dumps(meta, indent=2))
-            writer_thread = threading.Thread(
-                target=lambda: guarded(writer), daemon=True
-            )
-            writer_thread.start()
-        else:
+        if world_serial:
+            wp = rs.pipeline()
+            wc = rs.config()
+            wc.enable_device(world_serial)
+            wc.enable_stream(rs.stream.color, w, h, rs.format.rgb8, fps)
+            wprofile = wp.start(wc)
+            pipelines.append(wp)
+            meta["world_camera"] = {
+                "serial": world_serial,
+                "name": wprofile.get_device().get_info(rs.camera_info.name),
+                "intrinsics": intrinsics(wprofile.get_stream(rs.stream.color)),
+                "firmware": wprofile.get_device().get_info(
+                    rs.camera_info.firmware_version
+                ),
+            }
+            worker_fns.append(lambda: world_loop(wp))
+        if session is not None:
             session.setup(meta)
+        elif interactive:
+            root.mkdir(parents=True, exist_ok=True)
+            meta["session_started_unix_s"] = time.time()
+        else:
+            start_episode()
         camera_sensor.start(video_callback)
         camera_started = True
         for fn in worker_fns:
@@ -324,22 +564,66 @@ def record(
         if visualize:
             from .viewer import Viewer
 
-            viewer = Viewer(config, meta["rgb_intrinsics"], port)
+            viewer = Viewer(
+                config,
+                meta["rgb_intrinsics"],
+                port,
+                on_toggle=(lambda: requests.put("toggle")) if interactive else None,
+            )
+        if interactive:
+            keyboard = _keyboard(requests)
+            keyboard.__enter__()
+            print(
+                "Warm up the T265 (move slowly until confidence 3).\n"
+                "SPACE start/stop episode · q quit"
+                + (f" · episodes auto-stop after {seconds:g} s" if seconds else ""),
+                flush=True,
+            )
+        session_start, last_status = time.monotonic(), 0.0
         if session is not None:
             session.run(latest, lock, viewer, stop)
-        else:
-            end = time.monotonic() + seconds
-            while time.monotonic() < end and not stop.wait(0.05):
-                if viewer:
-                    with lock:
-                        current = latest.copy()
-                    viewer.update(current)
+        while session is None and not stop.wait(0.05):
+            with lock:
+                current = latest.copy()
+                episode = active["episode"]
+            elapsed = time.monotonic() - (episode.started if episode else session_start)
+            if not interactive and elapsed >= seconds:
+                break
+            quit_requested = False
+            while not requests.empty():
+                request = requests.get()
+                if request == "quit":
+                    quit_requested = True
+                elif episode is None:
+                    start_episode()
+                else:
+                    stop_episode()
+            if quit_requested:
+                break
+            with lock:
+                episode = active["episode"]
+            elapsed = time.monotonic() - (episode.started if episode else session_start)
+            if interactive and episode and seconds and elapsed >= seconds:
+                stop_episode()
+                episode = None
+            confidence = current.get("pose", {}).get("tracker_confidence")
+            state = (
+                f"● REC {episode.root.name} {elapsed:5.1f} s"
+                if episode
+                else f"idle · {len(finished)} saved · SPACE to record"
+            )
+            if viewer:
+                viewer.update(current, state if interactive else None)
+            if interactive and time.monotonic() - last_status > 0.2:
+                last_status = time.monotonic()
+                print(f"\r  {_confidence_badge(confidence, tracking)} · {state}    ", end="", flush=True)
     except KeyboardInterrupt:
         pass
     except Exception as e:  # noqa: BLE001 — propagate worker/shutdown failures to caller
         errors.put(e)
     finally:
         stop.set()
+        keyboard.__exit__(None, None, None)
         if camera_sensor is not None:
             try:
                 if camera_started:
@@ -356,14 +640,7 @@ def record(
                 p.stop()
             except Exception as e:  # noqa: BLE001 — propagate worker/shutdown failures to caller
                 errors.put(e)
-        if writer_thread and writer_thread.is_alive():
-            try:
-                q.put(None, timeout=5)
-            except queue.Full:
-                errors.put(RuntimeError("Writer stuck"))
-            writer_thread.join(timeout=30)
-            if writer_thread.is_alive():
-                errors.put(RuntimeError("Writer shutdown timed out"))
+        stop_episode(None if errors.empty() else errors.queue[0])
         if session is not None:
             try:
                 session.close(
@@ -375,13 +652,8 @@ def record(
                 errors.put(e)
         if viewer:
             viewer.close()
+        if interactive:
+            print(flush=True)
     if not errors.empty():
-        error = errors.get()
-        if root.exists():
-            (root / "FAILED.txt").write_text(str(error))
-        raise error
-    if session is None:
-        (root / "COMPLETE").write_text(
-            "Raw capture closed successfully; not yet quality validated.\n"
-        )
-    return root
+        raise errors.get()
+    return finished if interactive else root

@@ -5,6 +5,7 @@
 A local, uv-managed capture and calibration toolkit with Viser preview and an official **LeRobot v3.0** exporter. It uses the T265's onboard visual–inertial pose estimate, D405 RGB/depth, and two finger ArUco markers. It does not drive robot hardware.
 
 **Single-arm Karma/YAM workflow:** [capture, relative action export and offline robot feasibility](docs/single-arm-umi.md).
+**ACT policy on the YAM arm:** [training, deployment, camera/proprioception inputs and inference commands](docs/act-relative-policy.md).
 The latest three-episode batch has no valid jaw-width labels because marker 13
 was not decoded. Fix that before collecting more training demonstrations. The
 recorder now requires valid width as well as tracking before an episode starts.

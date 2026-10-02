@@ -1,5 +1,9 @@
 # Single-arm UMI: implemented path and remaining gates
 
+> **Update 2026-10-03:** an ACT relative-trajectory policy trained on `session-02` now runs
+> live on the right YAM arm. See [act-relative-policy.md](act-relative-policy.md). The status
+> below describes the earlier diffusion baseline path.
+
 The capture rig is D405 RGB/depth + T265 tracking + marker-measured YAM jaw opening.
 The robot target is one YAM arm controlled through Karma. Recording works without
 starting the cameras again between episodes. An offline processor now builds

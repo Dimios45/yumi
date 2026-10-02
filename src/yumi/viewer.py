@@ -7,13 +7,20 @@ from .markers import Markers
 
 
 class Viewer:
-    def __init__(self, config, intrinsics, port):
+    def __init__(self, config, intrinsics, port, on_toggle=None):
         self.server = viser.ViserServer(host="0.0.0.0", port=port)
         self.server.scene.set_up_direction("+y")
+        self.confidence = self.server.gui.add_markdown("## T265 confidence: starting…")
+        self.recording = None
+        if on_toggle is not None:
+            self.recording = self.server.gui.add_markdown("idle")
+            button = self.server.gui.add_button("Start / stop episode (space)")
+            button.on_click(lambda _: on_toggle())
         self.status = self.server.gui.add_markdown("Waiting for camera / tracker")
         self.image = self.server.gui.add_image(
             np.zeros((240, 320, 3), dtype=np.uint8), label="D405 RGB"
         )
+        self.world = None
         self.frame = self.server.scene.add_frame(
             "/tool", axes_length=0.08, axes_radius=0.003
         )
@@ -22,7 +29,9 @@ class Viewer:
         if config.get("markers", {}).get("size_m"):
             self.markers = Markers(config["markers"], intrinsics)
 
-    def update(self, latest):
+    def update(self, latest, recording=None):
+        if self.recording is not None and recording is not None:
+            self.recording.content = f"**{recording}**"
         messages = []
         if "rgb" in latest:
             rgb = latest["rgb"]
@@ -56,6 +65,12 @@ class Viewer:
                 except ValueError as e:
                     messages.append(f"MEASUREMENT INVALID: {e}")
             self.image.image = display
+        if "world" in latest:
+            if self.world is None:
+                self.world = self.server.gui.add_image(
+                    np.zeros((240, 320, 3), dtype=np.uint8), label="World camera"
+                )
+            self.world.image = cv2.resize(latest["world"], (320, 240))
         if "pose" in latest:
             p = latest["pose"]
             a = pose_matrix(p["position"], p["quaternion_xyzw"])
@@ -66,9 +81,10 @@ class Viewer:
             q = Rotation.from_matrix(a[:3, :3]).as_quat()
             self.frame.position = a[:3, 3]
             self.frame.wxyz = q[[3, 0, 1, 2]]
-            messages.append(
-                f"T265 confidence: {p['tracker_confidence']}/3 (live preview uses latest pose)"
-            )
+            level = p["tracker_confidence"]
+            name = {0: "FAILED", 1: "LOW", 2: "MEDIUM", 3: "HIGH"}.get(level, "?")
+            mark = "🟢" if level == 3 else "🟡" if level == 2 else "🔴"
+            self.confidence.content = f"## {mark} T265 confidence {level}/3 · {name}"
         self.status.content = "\n\n".join(messages) or "Waiting for samples"
 
     def close(self):

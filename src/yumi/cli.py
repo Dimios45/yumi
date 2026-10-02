@@ -23,9 +23,22 @@ def main():
     s = sub.add_parser("record")
     s.add_argument("--config", required=True)
     s.add_argument("--output", required=True)
-    s.add_argument("--seconds", type=float, default=30)
+    s.add_argument(
+        "--seconds",
+        type=float,
+        help="Episode length (default 30); with --interactive, optional auto-stop",
+    )
     s.add_argument("--no-viewer", action="store_true")
     s.add_argument("--camera-only", action="store_true")
+    s.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Keep sensors running; SPACE starts/stops output/episode-NNN, q quits",
+    )
+    s.add_argument(
+        "--world-serial",
+        help="Fixed external RGB camera to record too (default: config world_serial)",
+    )
     s.add_argument("--port", type=int, default=8080)
     s = sub.add_parser(
         "record-session", help="Keep devices running; save prompted LeRobot v3 episodes"
@@ -152,14 +165,17 @@ def main():
         elif a.command == "record":
             from .hardware import record
 
+            config = json.loads(Path(a.config).read_text())
             print(
                 record(
-                    json.loads(Path(a.config).read_text()),
+                    config,
                     a.output,
                     a.seconds,
                     not a.no_viewer,
                     a.port,
                     not a.camera_only,
+                    interactive=a.interactive,
+                    world_serial=a.world_serial or config.get("world_serial"),
                 )
             )
         elif a.command == "record-session":

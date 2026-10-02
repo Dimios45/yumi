@@ -8,3 +8,4 @@ data/
 *.egg-info/
 configs/umi.local.json
 configs/hardware-test.json
+configs/world_camera.json
