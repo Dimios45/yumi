@@ -29,6 +29,14 @@ class CaptureQuality:
             reasons.append("Tracker stale or missing")
         if pose.get("tracker_confidence") != 3:
             reasons.append("Tracker confidence below 3/3")
+        sensor_ready = not reasons
+        sensor_reasons = reasons.copy()
         if self.error:
             reasons.append(self.error)
-        return {"ready": not reasons, "width_m": self.width, "reasons": reasons}
+        return {
+            "ready": not reasons,
+            "sensor_ready": sensor_ready,
+            "sensor_reasons": sensor_reasons,
+            "width_m": self.width,
+            "reasons": reasons,
+        }

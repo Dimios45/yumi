@@ -65,3 +65,22 @@ def test_append_is_compatible_with_fitter_and_checks_identity(tmp_path):
     with pytest.raises(ValueError, match="match"):
         append_sample(path, config, ready_pair().snapshot(10.2), 30.0)
     assert len(json.loads(path.read_text())["captures"]) == 1
+
+
+def test_width_samples_cannot_mix_corner_detectors(tmp_path):
+    config = {
+        "rgb_serial": "test",
+        "resolution": [640, 480],
+        "markers": {
+            "dictionary": "DICT_4X4_50",
+            "ids": [13, 14],
+            "size_m": 0.01,
+            "width_range_m": [0, 0.1],
+            "corner_refinement": "subpix",
+        },
+    }
+    path = tmp_path / "width.json"
+    append_sample(path, config, ready_pair().snapshot(10.2), 30)
+    config["markers"]["corner_refinement"] = "apriltag"
+    with pytest.raises(ValueError, match="match"):
+        append_sample(path, config, ready_pair().snapshot(10.2), 40)

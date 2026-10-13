@@ -128,7 +128,10 @@ def calibrate_board(raw_root, marker_id, size_m, dictionary="DICT_4X4_50"):
         raise ValueError("Board marker size must be positive")
     ti, tp, image_clock, pose_clock = synchronize_streams(images, poses)
     limit = meta["config"].get("max_clock_jitter_s", 0.015)
-    if any(r["arrival_jitter_p95_s"] > limit for r in (image_clock, pose_clock)):
+    if any(
+        r["alignment"] != "shared_sdk_global_time" and r["arrival_jitter_p95_s"] > limit
+        for r in (image_clock, pose_clock)
+    ):
         raise ValueError(
             "Capture timing jitter exceeds calibration gate; fix acquisition first"
         )
@@ -301,6 +304,31 @@ def capture_width_sample(config, opening_mm, samples_path, frames=60):
         json.dump(doc, f, indent=2, allow_nan=False)
     temporary.replace(path)
     return capture
+
+
+def fit_piecewise_image_width(samples, *, minimum_samples=6):
+    """Monotonic interpolation through measured settings; not a validation score."""
+    x = np.asarray(samples["marker_separation_px"], float)
+    y = np.asarray(samples["jaw_opening_m"], float)
+    if not isinstance(minimum_samples, int) or minimum_samples < 4:
+        raise ValueError("At least four calibration settings required")
+    if x.shape != y.shape or x.ndim != 1 or len(x) < minimum_samples or not np.isfinite([x, y]).all():
+        raise ValueError(f"Need at least {minimum_samples} finite paired measurements")
+    order = np.argsort(x)
+    x, y = x[order], y[order]
+    if np.any(np.diff(x) <= 0) or np.any(np.diff(y) <= 0) or y[0] < 0 or np.ptp(y) < 0.02:
+        raise ValueError("Measured pixel distances and openings must increase together")
+    # Only absorb measured endpoint detector jitter; this does not extend travel.
+    spreads = [float(c.get("separation_p95_p05", 0)) for c in samples.get("captures", [])]
+    tolerance = min(2.0, max([0.5, *spreads]))
+    return {"width_method": "image_calibrated", "image_width_calibration": {
+        "model": "piecewise_linear", "separation_knots_px": x.tolist(), "opening_knots_m": y.tolist(),
+        "separation_range_px": [float(x[0]), float(x[-1])],
+        "resolution": samples["calibration_identity"]["resolution"],
+        "calibration_identity": samples["calibration_identity"],
+        "endpoint_tolerance_px": tolerance,
+        "validation_status": "measured_lookup_not_independently_validated",
+        "note": "All measured knots retained. Exact knot interpolation is not independent accuracy validation. Endpoint noise within tolerance clamps to the measured endpoint."}}
 
 
 def fit_image_width(samples, max_error_m=0.001):

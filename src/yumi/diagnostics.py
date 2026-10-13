@@ -77,7 +77,7 @@ def inspect_recording(root, config=None):
             for marker in c["markers"]["ids"]:
                 counts[str(marker)] += marker in found
             try:
-                distance, error, _ = detector.measure(
+                distance, error, _ = detector.measurement(
                     cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 )
                 values.append(distance)
@@ -87,6 +87,7 @@ def inspect_recording(root, config=None):
                 reasons[reason] += 1
                 examples.setdefault(reason, row["rgb_path"])
         report["markers"] = {
+            "measurement_method": c["markers"].get("width_method", "metric_pnp"),
             "size_m": c["markers"]["size_m"],
             "images_checked": len(images),
             "individual_detection_counts": dict(counts),
@@ -96,7 +97,10 @@ def inspect_recording(root, config=None):
             "failure_examples": examples,
         }
         if values:
-            report["markers"]["center_separation_p05_p50_p95_m"] = np.quantile(
+            unit = (
+                "px" if c["markers"].get("width_method") == "image_calibrated" else "m"
+            )
+            report["markers"][f"center_separation_p05_p50_p95_{unit}"] = np.quantile(
                 values, [0.05, 0.5, 0.95]
             ).tolist()
             report["markers"]["reprojection_p50_p95_px"] = np.quantile(

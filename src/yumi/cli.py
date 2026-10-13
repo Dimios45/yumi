@@ -46,7 +46,17 @@ def main():
     s.add_argument("--config", required=True)
     s.add_argument("--output", required=True)
     s.add_argument("--episodes", type=int, default=3)
-    s.add_argument("--seconds", type=float, default=30)
+    s.add_argument(
+        "--require-valid-width",
+        action="store_true",
+        help="Also require calibrated jaw width before raw recording starts",
+    )
+    s.add_argument(
+        "--seconds",
+        type=float,
+        default=0,
+        help="Auto-stop each episode after this long (0 = only SPACE stops it)",
+    )
     s.add_argument("--warmup", type=float, default=30)
     s.add_argument("--task", required=True)
     s.add_argument("--repo-id", default="local/yumi-session")
@@ -185,10 +195,18 @@ def main():
             c = json.loads(Path(a.config).read_text())
             c["task"] = a.task
             session = Session(
-                a.output, a.episodes, a.seconds, a.warmup, a.task, a.repo_id
+                a.output,
+                a.episodes,
+                a.seconds,
+                a.warmup,
+                a.task,
+                a.repo_id,
+                require_valid_width=a.require_valid_width,
             )
             print(
-                record(c, a.output, a.seconds, not a.no_viewer, a.port, True, session)
+                record(
+                    c, a.output, a.seconds or None, not a.no_viewer, a.port, True, session
+                )
             )
         elif a.command == "prepare-session":
             from .session_processing import prepare_session

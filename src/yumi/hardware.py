@@ -6,6 +6,7 @@ import json
 import os
 import queue
 import select
+import signal
 import sys
 import threading
 import time
@@ -13,6 +14,19 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
+
+@contextlib.contextmanager
+def _uninterrupted_cleanup():
+    """Let sensor shutdown and writer draining finish after the first Ctrl+C."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
 
 
 def sdk():
@@ -236,6 +250,8 @@ def record(
     session=None,
     interactive=False,
     world_serial=None,
+    max_episodes=None,
+    require_tracker_confidence=None,
 ):
     """Lossless raw episodes, independent sensor polling threads and bounded writer queues.
 
@@ -253,10 +269,17 @@ def record(
     ``world_serial`` adds a fixed external (world) RGB camera, saved as
     ``kind: "world"`` samples under ``world/``.
 
+    ``max_episodes`` returns after this many interactive episodes, allowing a
+    caller to review one capture before starting another.
+
     Queue overload aborts capture; it never silently drops a frame.
     """
     if seconds is not None and seconds <= 0:
         raise ValueError("seconds must be positive")
+    if max_episodes is not None and (
+        not interactive or session is not None or max_episodes < 1
+    ):
+        raise ValueError("max_episodes requires interactive raw capture and a positive count")
     if not interactive and seconds is None:
         seconds = 30
     rs = sdk()
@@ -302,6 +325,12 @@ def record(
                 return
         path = _next_episode(root) if interactive else root
         confidence = latest.get("pose", {}).get("tracker_confidence")
+        if tracking and require_tracker_confidence is not None and (
+            confidence is None or confidence < require_tracker_confidence
+        ):
+            print(f"\nNot recording: T265 confidence {confidence}; wait for "
+                  f"{require_tracker_confidence}/3, then press SPACE again.", flush=True)
+            return
         episode = Episode(path, meta)
         with lock:
             active["episode"] = episode
@@ -333,6 +362,8 @@ def record(
             )
         failure = episode.close(error)
         finished.append(episode.root)
+        if max_episodes is not None and len(finished) >= max_episodes:
+            stop.set()
         if failure is not None:
             errors.put(failure)
         elif interactive:
@@ -590,7 +621,7 @@ def record(
             if not interactive and elapsed >= seconds:
                 break
             quit_requested = False
-            while not requests.empty():
+            while not requests.empty() and not stop.is_set():
                 request = requests.get()
                 if request == "quit":
                     quit_requested = True
@@ -622,38 +653,39 @@ def record(
     except Exception as e:  # noqa: BLE001 — propagate worker/shutdown failures to caller
         errors.put(e)
     finally:
-        stop.set()
-        keyboard.__exit__(None, None, None)
-        if camera_sensor is not None:
-            try:
-                if camera_started:
-                    camera_sensor.stop()
-                camera_sensor.close()
-            except RuntimeError as e:
-                errors.put(e)
-        for worker in workers:
-            worker.join(timeout=5)
-        if any(t.is_alive() for t in workers):
-            errors.put(RuntimeError("Sensor worker did not stop"))
-        for p in reversed(pipelines):
-            try:
-                p.stop()
-            except Exception as e:  # noqa: BLE001 — propagate worker/shutdown failures to caller
-                errors.put(e)
-        stop_episode(None if errors.empty() else errors.queue[0])
-        if session is not None:
-            try:
-                session.close(
-                    None
-                    if errors.empty()
-                    else RuntimeError("Capture failed; see FAILED.txt")
-                )
-            except Exception as e:  # noqa: BLE001 — propagate shutdown failures
-                errors.put(e)
-        if viewer:
-            viewer.close()
-        if interactive:
-            print(flush=True)
+        with _uninterrupted_cleanup():
+            stop.set()
+            keyboard.__exit__(None, None, None)
+            if camera_sensor is not None:
+                try:
+                    if camera_started:
+                        camera_sensor.stop()
+                    camera_sensor.close()
+                except RuntimeError as e:
+                    errors.put(e)
+            for worker in workers:
+                worker.join(timeout=5)
+            if any(t.is_alive() for t in workers):
+                errors.put(RuntimeError("Sensor worker did not stop"))
+            for p in reversed(pipelines):
+                try:
+                    p.stop()
+                except Exception as e:  # noqa: BLE001 — propagate worker/shutdown failures to caller
+                    errors.put(e)
+            stop_episode(None if errors.empty() else errors.queue[0])
+            if session is not None:
+                try:
+                    session.close(
+                        None
+                        if errors.empty()
+                        else RuntimeError("Capture failed; see FAILED.txt")
+                    )
+                except Exception as e:  # noqa: BLE001 — propagate shutdown failures
+                    errors.put(e)
+            if viewer:
+                viewer.close()
+            if interactive:
+                print(flush=True)
     if not errors.empty():
         raise errors.get()
     return finished if interactive else root

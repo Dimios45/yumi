@@ -65,7 +65,10 @@ def prepare(root, output, calibration=None):
     ti, tp, image_clock, pose_clock = synchronize_streams(images, poses)
     ti += c["camera_time_offset_s"]
     for report in (image_clock, pose_clock):
-        if report["arrival_jitter_p95_s"] > c["max_clock_jitter_s"]:
+        if (
+            report["alignment"] != "shared_sdk_global_time"
+            and report["arrival_jitter_p95_s"] > c["max_clock_jitter_s"]
+        ):
             raise ValueError(f"Excessive USB timing jitter: {report}")
     start = max(ti[0], tp[0]) + c["warmup_s"]
     end = min(ti[-1], tp[-1]) - 0.1
@@ -87,8 +90,10 @@ def prepare(root, output, calibration=None):
     if np.min(conf[selected]) < c["min_tracker_confidence"]:
         raise ValueError("Tracking loss inside episode")
     raw_mats = np.asarray([pose_matrix(a, b) for a, b in zip(p[selected], q[selected])])
+    if np.any(np.diff(tp[selected]) > c["max_pose_gap_s"]):
+        raise ValueError("Pose gap inside episode")
     check_motion(
-        tp[selected], raw_mats, c["max_speed_m_s"], c["max_angular_speed_rad_s"]
+        tp[selected], raw_mats @ ext, c["max_speed_m_s"], c["max_angular_speed_rad_s"]
     )
     detector = Markers(c["markers"], meta["rgb_intrinsics"])
     matrices, widths, errors = [], [], []
@@ -147,7 +152,7 @@ def prepare(root, output, calibration=None):
         manifest["samples"].append(
             {
                 "rgb_path": images[i]["rgb_path"],
-                "depth_path": images[i]["depth_path"],
+                "depth_path": images[i].get("depth_path"),
                 "state": states[n].tolist(),
                 "action": states[n + 1].tolist(),
                 "sensor_time_s": float(ti[i] - grid[0]),

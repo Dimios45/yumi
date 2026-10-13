@@ -59,7 +59,15 @@ def fit_clock(device, arrival):
 def interpolate_pose(
     times, positions, quaternions, confidence, query, max_gap=0.025, min_confidence=3
 ):
-    t = np.asarray(times)
+    t = np.asarray(times, float)
+    if (
+        t.ndim != 1
+        or len(t) < 2
+        or not np.isfinite(t).all()
+        or np.any(np.diff(t) <= 0)
+        or not np.isfinite(query)
+    ):
+        raise ValueError("Need finite increasing pose times and query")
     j = int(np.searchsorted(t, query, side="right"))
     if j == 0 or j == len(t):
         raise ValueError("Pose extrapolation forbidden")
@@ -75,6 +83,18 @@ def interpolate_pose(
 
 
 def check_motion(times, matrices, max_speed, max_angular_speed):
+    times, matrices = np.asarray(times, float), np.asarray(matrices, float)
+    if (
+        times.ndim != 1
+        or matrices.shape != (len(times), 4, 4)
+        or not np.isfinite(times).all()
+        or not np.isfinite(matrices).all()
+        or not np.isfinite([max_speed, max_angular_speed]).all()
+        or min(max_speed, max_angular_speed) <= 0
+    ):
+        raise ValueError(
+            "Finite matching poses/times and positive motion limits required"
+        )
     dt = np.diff(times)
     if np.any(dt <= 0):
         raise ValueError("Non-monotonic samples")

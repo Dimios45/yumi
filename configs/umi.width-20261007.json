@@ -1,0 +1,95 @@
+{
+  "rgb_serial": "352122273221",
+  "tracking_serial": "943222111495",
+  "world_serial": "243622071623",
+  "resolution": [
+    640,
+    480
+  ],
+  "fps": 30,
+  "task": "Describe the manipulation task",
+  "T_tracker_tcp": null,
+  "calibration_verified": false,
+  "timing_verified": false,
+  "camera_time_offset_s": 0.0,
+  "warmup_s": 2.0,
+  "max_clock_jitter_s": 0.015,
+  "max_image_skew_s": 0.012,
+  "max_pose_gap_s": 0.025,
+  "min_tracker_confidence": 3,
+  "max_speed_m_s": 2.0,
+  "max_angular_speed_rad_s": 12.0,
+  "max_width_speed_m_s": 0.4,
+  "markers": {
+    "dictionary": "DICT_4X4_50",
+    "ids": [
+      13,
+      14
+    ],
+    "size_m": 0.01,
+    "min_side_px": 16,
+    "max_reprojection_px": 1.0,
+    "max_ambiguity_m": 0.002,
+    "width_gain": null,
+    "width_offset_m": null,
+    "width_range_m": [
+      0,
+      0.053
+    ],
+    "width_method": "image_calibrated",
+    "image_width_calibration": {
+      "model": "piecewise_linear",
+      "separation_knots_px": [
+        73.03605408052411,
+        138.3091823480593,
+        171.86347648210236,
+        304.68940496647696,
+        342.36661998292465,
+        380.1325673295598
+      ],
+      "opening_knots_m": [
+        0.0,
+        0.011,
+        0.019,
+        0.04,
+        0.046,
+        0.053
+      ],
+      "separation_range_px": [
+        73.03605408052411,
+        380.1325673295598
+      ],
+      "resolution": [
+        640,
+        480
+      ],
+      "calibration_identity": {
+        "width_method": "image_calibrated",
+        "resolution": [
+          640,
+          480
+        ],
+        "rgb_serial": "352122273221",
+        "markers": {
+          "dictionary": "DICT_4X4_50",
+          "ids": [
+            13,
+            14
+          ],
+          "size_m": 0.01
+        },
+        "detector": {
+          "corner_refinement": "apriltag",
+          "min_side_px": 16,
+          "min_border_px": 3
+        }
+      },
+      "endpoint_tolerance_px": 0.5283050024732461,
+      "validation_status": "measured_lookup_not_independently_validated",
+      "note": "All measured knots retained. Exact knot interpolation is not independent accuracy validation. Endpoint noise within tolerance clamps to the measured endpoint.",
+      "source_samples": "data/calibration/width-20261007-recalibration.json",
+      "source_sha256": "2c45b0317b9936abc2ff1d04b80d3f7351dd6d022b7da13f5f451ac0ca50b5b1"
+    },
+    "corner_refinement": "apriltag"
+  }
+}

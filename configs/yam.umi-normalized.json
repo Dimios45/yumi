@@ -1,0 +1,12 @@
+{
+  "initial_joints_rad": [0, 0, 0, 0, 0, 0],
+  "T_capture_tcp_robot_tool": [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]],
+  "umi_width_range_m": [0.0, 0.053],
+  "yam_command_range": [0.0, 1.0],
+  "yam_command_convention": "native_open",
+  "robot_gripper_type": "linear_4310",
+  "max_joint_speed_rad_s": 0.5,
+  "ik_max_iterations": 80,
+  "registration_verified": false,
+  "notes": "Episode-relative motion anchored at YAM home grasp_site, with capture/tool axes assumed equal. The UMI has measured 0–53 mm travel; YAM uses its own normalized open command, NOT UMI millimetres. i2rt model slider travel is read from its XML. Physical robot aperture and capture-to-robot registration are not independently measured."
+}

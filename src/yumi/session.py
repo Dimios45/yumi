@@ -3,11 +3,9 @@
 import json
 import pickle
 import queue
-import select
 import shutil
 import struct
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
@@ -21,10 +19,19 @@ def send_packet(pipe, value):
 
 
 class Session:
-    def __init__(self, output, episodes, seconds, warmup, task, repo_id):
-        if episodes < 1 or seconds <= 0 or warmup < 0 or not task.strip():
+    def __init__(
+        self,
+        output,
+        episodes,
+        seconds,
+        warmup,
+        task,
+        repo_id,
+        require_valid_width=False,
+    ):
+        if episodes < 1 or seconds < 0 or warmup < 0 or not task.strip():
             raise ValueError(
-                "Require positive episodes/seconds, nonnegative warmup and a task"
+                "Require positive episodes, nonnegative seconds/warmup and a task"
             )
         self.root = Path(output).resolve()
         if self.root.exists():
@@ -41,8 +48,16 @@ class Session:
         self.saved = 0
         self.closed = False
         self.meta = None
+        self.require_valid_width = require_valid_width
 
     def setup(self, meta):
+        from .geometry import transform
+
+        # Raw collection is useful before TCP calibration. Validate supplied
+        # transforms, but preserve a missing transform as missing in metadata.
+        ext = meta["config"].get("T_tracker_tcp")
+        if ext is not None:
+            transform(ext)
         self.meta = meta
         project = Path(__file__).resolve().parents[2] / "exporter"
         python = project / ".venv/bin/python"
@@ -87,11 +102,12 @@ class Session:
     def _write(self):
         import numpy as np
 
-        from .geometry import pose_matrix, state
+        from .geometry import pose_matrix, state, transform
         from .markers import Markers
 
         detector = Markers(self.meta["config"]["markers"], self.meta["rgb_intrinsics"])
-        ext = np.asarray(self.meta["config"]["T_tracker_tcp"])
+        calibration = self.meta["config"].get("T_tracker_tcp")
+        ext = transform(calibration) if calibration is not None else np.eye(4)
         pose = None
         try:
             while True:
@@ -107,7 +123,22 @@ class Session:
                     if item.get("kind") == "image":
                         width, width_ok = 0.0, False
                         try:
-                            width, _, _ = detector.width(item["rgb"])
+                            separation, error, centers = detector.measurement(
+                                item["rgb"]
+                            )
+                            item["marker_measurement"] = {
+                                "separation": float(separation),
+                                "units": "px"
+                                if detector.c.get("width_method") == "image_calibrated"
+                                else "m",
+                                "centers": np.asarray(centers).tolist(),
+                                "reprojection_error_px": float(error)
+                                if error >= 0
+                                else None,
+                            }
+                            width = detector.opening_from_separation(
+                                separation, item["rgb"].shape[:2][::-1]
+                            )
                             width_ok = True
                         except ValueError as e:
                             item["width_error"] = str(e)
@@ -117,6 +148,7 @@ class Session:
                         }
                         pose_ok = (
                             pose is not None
+                            and item["domain"] == pose["domain"]
                             and abs(item["device_s"] - pose["device_s"]) < 0.05
                         )
                         matrix = (
@@ -191,6 +223,21 @@ class Session:
         raise RuntimeError(f"Timed out waiting for writer {desired}")
 
     def run(self, latest, lock, viewer, stop):
+        from .hardware import _keyboard
+
+        self.keys = queue.Queue()  # "toggle" (space) / "quit" (q)
+        with _keyboard(self.keys):
+            self._run(latest, lock, viewer, stop)
+
+    def key(self):
+        try:
+            return self.keys.get_nowait()
+        except queue.Empty:
+            return None
+
+    def _run(self, latest, lock, viewer, stop):
+        from .hardware import _confidence_badge
+
         panel = viewer.server.gui.add_markdown("Session starting") if viewer else None
         state = "WARMUP"
         from .capture_quality import CaptureQuality
@@ -211,20 +258,30 @@ class Session:
             if viewer:
                 viewer.update(current)
             if panel:
-                panel.content = (
-                    f"**{state}** · saved {self.saved}/{self.episodes}\n\n"
-                    + (
-                        f"Width {health['width_m'] * 1000:.1f} mm; capture ready"
-                        if health["ready"]
-                        else "**NOT READY:** " + "; ".join(health["reasons"])
+                if health["ready"]:
+                    status = f"Width {health['width_m'] * 1000:.1f} mm; capture ready"
+                elif not self.require_valid_width and health.get("sensor_ready", False):
+                    status = (
+                        "**RAW CAPTURE READY** · width marked invalid: "
+                        + "; ".join(health["reasons"])
                     )
+                else:
+                    status = "**NOT READY:** " + "; ".join(health["reasons"])
+                panel.content = (
+                    f"**{state}** · saved {self.saved}/{self.episodes}\n\n" + status
                 )
             self.check()
             return current
 
         self.wait_reply("ready", tick)
         print(
-            f"\nSESSION · {self.episodes} episodes × {self.seconds:g}s · {self.root}\n"
+            f"\nSESSION · {self.episodes} episodes"
+            + (
+                f" × up to {self.seconds:g}s"
+                if self.seconds
+                else ", SPACE starts/stops each"
+            )
+            + f" · {self.root}\n"
             "Devices remain running between episodes. Warmup/reset frames are not saved.\n"
             "Move gently until tracking is 3/3. Keep the browser preview open.",
             flush=True,
@@ -245,58 +302,100 @@ class Session:
                 last_print = elapsed
             time.sleep(0.05)
         print(
-            "\nWarmup complete. Starting requires valid jaw width and fresh confidence 3/3 for 1 second."
+            "\nWarmup complete. SPACE starts recording at any time; tracking, marker and width"
+            " problems are shown live and saved per frame."
+            + (
+                " --require-valid-width: starts wait for confidence 3/3 and valid width for 1 second."
+                if self.require_valid_width
+                else ""
+            )
         )
         while self.saved < self.episodes:
-            state = "READY — Enter to record; q to exit"
+            state = "READY — SPACE to record; q to exit"
             print(
-                f"\nEpisode {self.saved + 1}/{self.episodes} · Enter = record {self.seconds:g}s "
+                f"\nEpisode {self.saved + 1}/{self.episodes} · SPACE = start recording "
                 "· q = finish (Ctrl+C also exits here)",
                 flush=True,
             )
+            last_status = 0.0
             while True:
                 current = tick()
                 now = time.monotonic()
                 pose = current.get("pose", {})
                 fresh = now - pose.get("arrival_s", -1e20) < 0.25
-                good = fresh and health["ready"]
+                good = fresh and (
+                    health["ready"]
+                    if self.require_valid_width
+                    else health.get("sensor_ready", health["ready"])
+                )
                 stable_since = (stable_since or now) if good else None
-                if select.select([sys.stdin], [], [], 0.05)[0]:
-                    line = sys.stdin.readline()
-                    if not line or line.strip().lower() == "q":
-                        return
-                    if line.strip():
-                        print("Press Enter to record, or type q to finish.", flush=True)
-                        continue
-                    if stable_since is None or now - stable_since < 1:
-                        print(
-                            "NOT STARTED: "
-                            + (
-                                "; ".join(health["reasons"])
-                                or "Hold valid tracking and width for 1 second"
-                            ),
-                            flush=True,
-                        )
-                        continue
-                    # Reserve enough for lossless compressed depth, RGB staging and encoded output.
-                    required = max(512 * 1024**2, int(self.seconds * 45 * 1024**2))
-                    if shutil.disk_usage(self.root).free < required:
-                        print(
-                            f"NOT STARTED: need about {required / 1024**3:.1f} GiB free for this episode.",
-                            flush=True,
-                        )
-                        continue
-                    break
+                if (
+                    now - last_status > 0.2
+                ):  # live status, like `yumi record --interactive`
+                    last_status = now
+                    issues = "; ".join(health["reasons"]) or (
+                        f"markers OK · width {health['width_m'] * 1000:.1f} mm"
+                    )
+                    print(
+                        f"\r\033[K  {_confidence_badge(pose.get('tracker_confidence') if fresh else 0)}"
+                        f" · {issues} · SPACE to record",
+                        end="",
+                        flush=True,
+                    )
+                key = self.key()
+                if key is None:
+                    time.sleep(0.05)
+                    continue
+                if key == "quit":
+                    print(flush=True)
+                    return
+                if self.require_valid_width and (
+                    stable_since is None or now - stable_since < 1
+                ):
+                    print(
+                        "\nNOT STARTED (--require-valid-width): "
+                        + (
+                            "; ".join(health["reasons"])
+                            or "hold valid tracking/width for 1 second"
+                        ),
+                        flush=True,
+                    )
+                    continue
+                if not good:  # start anyway; the issues are saved per frame
+                    print(
+                        "\nStarting with: "
+                        + ("; ".join(health["reasons"]) or "stale tracking or RGB"),
+                        end="",
+                        flush=True,
+                    )
+                print(flush=True)
+                # Reserve enough for lossless compressed depth, RGB staging and encoded output.
+                required = max(512 * 1024**2, int((self.seconds or 120) * 45 * 1024**2))
+                if shutil.disk_usage(self.root).free < required:
+                    print(
+                        f"NOT STARTED: need about {required / 1024**3:.1f} GiB free for this episode.",
+                        flush=True,
+                    )
+                    continue
+                break
             self.begin()
-            state = "RECORDING — Ctrl+C ends this episode"
+            state = "RECORDING — SPACE ends this episode"
             print(
-                f"RECORDING {self.saved + 1}/{self.episodes} · Ctrl+C = save early",
+                f"RECORDING {self.saved + 1}/{self.episodes} · SPACE = stop and save"
+                + (f" (auto-stops after {self.seconds:g}s)" if self.seconds else ""),
                 flush=True,
             )
+            while self.key() is not None:  # drop keys pressed before the start
+                pass
             start = time.monotonic()
             last_print = -1
+            quit_requested = False
             try:
-                while time.monotonic() - start < self.seconds:
+                while not self.seconds or time.monotonic() - start < self.seconds:
+                    key = self.key()
+                    if key is not None:
+                        quit_requested = key == "quit"
+                        break
                     current = tick()
                     elapsed = int(time.monotonic() - start)
                     if elapsed != last_print:
@@ -304,12 +403,12 @@ class Session:
                             "tracker_confidence", 0
                         )
                         print(
-                            f"\rREC {elapsed:3d}/{self.seconds:g}s · confidence {confidence}/3"
+                            f"\rREC {elapsed:3d}s · confidence {confidence}/3"
                             + (
                                 " — LOW TRACKING"
                                 if confidence < 3
                                 else (
-                                    " — WIDTH INVALID"
+                                    " — WIDTH INVALID: " + "; ".join(health["reasons"])
                                     if not health["ready"]
                                     else " — width OK       "
                                 )
@@ -334,9 +433,20 @@ class Session:
                     f"· invalid-width frames: {reply.get('invalid_width_frames', 0)}",
                     flush=True,
                 )
+                if reply.get("invalid_width_reasons"):
+                    print(
+                        "Width issues: "
+                        + "; ".join(
+                            f"{reason}: {count}"
+                            for reason, count in reply["invalid_width_reasons"].items()
+                        ),
+                        flush=True,
+                    )
             else:
                 print("No RGB frames received; empty episode discarded.", flush=True)
             stable_since = None
+            if quit_requested:
+                return
         print("\nRequested episodes collected.", flush=True)
 
     def close(self, error=None):

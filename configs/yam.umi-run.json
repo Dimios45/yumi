@@ -1,0 +1,20 @@
+{
+  "session": "/home/yambox/yumi/data/lerobot/session-20261010-173857",
+  "table_z": 0.0,
+  "grasp_height": 0.015,
+  "tcp_config": "configs/umi.review-collection.json",
+  "tool_roll_deg": 0.0,
+  "arm": "right",
+  "interface": "can_right",
+  "serial": "352122271723",
+  "exec_latency": 0.1,
+  "ik": "smooth",
+  "lift": 0.06,
+  "transit": 0.06,
+  "max_ik_miss": 25.0,
+  "min_z": 0.01,
+  "start_from_session": null,
+  "saved_from": "reviewed UMI task start",
+  "saved": "2026-10-10",
+  "umi_start_profile": "configs/yam.umi-start.json"
+}

@@ -79,6 +79,11 @@ def identity(config):
         "resolution": config["resolution"],
         "rgb_serial": config["rgb_serial"],
         "markers": {k: config["markers"][k] for k in ("dictionary", "ids", "size_m")},
+        "detector": {
+            "corner_refinement": config["markers"].get("corner_refinement", "subpix"),
+            "min_side_px": config["markers"].get("min_side_px", 16),
+            "min_border_px": config["markers"].get("min_border_px", 3),
+        },
     }
 
 
@@ -147,6 +152,20 @@ def serve(config, samples_path, port=8080, control_port=8081):
     last_result = {"message": "No samples saved in this session"}
     latest_frame = {}
 
+    def save_measurement(opening, validation=False):
+        target = Path(samples_path)
+        if validation:
+            target = target.with_name(target.stem + "-validation" + target.suffix)
+        with guard:
+            sample = state.snapshot(time.monotonic())
+            result = append_sample(target, config, sample, opening)
+            result["purpose"] = "validation" if validation else "fit"
+            state.last_used = sample["frame_number"]
+            last_result.clear()
+            last_result.update(result)
+        print(json.dumps(result), flush=True)
+        return result
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
             pass
@@ -192,13 +211,10 @@ def serve(config, samples_path, port=8080, control_port=8081):
                     raise ValueError("Invalid request size")
                 payload = json.loads(self.rfile.read(length))
                 opening = float(payload["opening_mm"])
-                with guard:
-                    sample = state.snapshot(time.monotonic())
-                    result = append_sample(samples_path, config, sample, opening)
-                    state.last_used = sample["frame_number"]
-                    last_result.clear()
-                    last_result.update(result)
-                print(json.dumps(result), flush=True)
+                validation = payload.get("validation", False)
+                if not isinstance(validation, bool):
+                    raise TypeError("validation must be boolean")
+                result = save_measurement(opening, validation)
                 self.respond(200, result)
             except (ValueError, KeyError, TypeError, OSError) as e:
                 self.respond(400, {"error": str(e)})
@@ -226,6 +242,32 @@ def serve(config, samples_path, port=8080, control_port=8081):
         profile = pipe.start(c)
         started = True
         viewer = Viewer(config, intrinsics(profile.get_stream(rs.stream.color)), port)
+        viewer.server.gui.add_markdown(
+            "Measure the gap **between the gripping faces** with calipers or a known spacer. "
+            "Hold that gap steady, enter its measured value, then save. "
+            "Use separate validation samples after collecting the fit settings."
+        )
+        opening_input = viewer.server.gui.add_number(
+            "Measured jaw gap (mm)",
+            initial_value=0.0,
+            min=0.0,
+            max=config["markers"]["width_range_m"][1] * 1000,
+            step=0.1,
+        )
+        validation_input = viewer.server.gui.add_checkbox(
+            "Validation sample (excluded from fit)", initial_value=False
+        )
+        save_button = viewer.server.gui.add_button("Save measured gap")
+
+        @save_button.on_click
+        def save_from_browser(_event):
+            try:
+                save_measurement(float(opening_input.value), validation_input.value)
+            except (ValueError, OSError) as e:
+                with guard:
+                    last_result.clear()
+                    last_result.update(error=str(e))
+
         feedback = viewer.server.gui.add_markdown("Waiting for a stable marker pair")
         print(
             f"Live width calibration ready. Terminal: uv run --locked yumi width-console --control-port {control_port}",
@@ -275,6 +317,7 @@ def console(control_port=8081):
     print(
         "Keep the browser preview open. Hold the measured jaw gap steady.\n"
         "Enter millimeters (e.g. 30) to save a fresh stable observation.\n"
+        "Enter v followed by millimeters (e.g. v 25) for an independent validation sample.\n"
         "Enter s for status; q to leave this terminal (server stays running).",
         flush=True,
     )
@@ -290,12 +333,15 @@ def console(control_port=8081):
             if text.lower() == "s":
                 request = Request(base + "/status")
             else:
-                opening = float(text)
+                validation = text.lower().startswith("v ")
+                opening = float(text[2:].strip() if validation else text)
                 if not np.isfinite(opening) or opening < 0:
                     raise ValueError("Enter a nonnegative measured opening")
                 request = Request(
                     base + "/sample",
-                    data=json.dumps({"opening_mm": opening}).encode(),
+                    data=json.dumps(
+                        {"opening_mm": opening, "validation": validation}
+                    ).encode(),
                     headers={"Content-Type": "application/json"},
                 )
             with urlopen(request, timeout=5) as response:

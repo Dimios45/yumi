@@ -11,6 +11,7 @@ import os
 import pickle
 import struct
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -87,7 +88,15 @@ def run(root, repo_id, task, source, replies):
             {
                 **meta,
                 "schema": "LeRobot v3 raw observations; not training-ready actions",
-                "state_semantics": "Provisional TCP pose in persistent T265 session frame; last received pose, not time-aligned; aperture metres.",
+                "state_pose_frame": "tcp"
+                if meta["config"].get("T_tracker_tcp") is not None
+                else "tracker",
+                "state_semantics": (
+                    "Provisional TCP pose"
+                    if meta["config"].get("T_tracker_tcp") is not None
+                    else "Raw tracker pose (TCP calibration absent)"
+                )
+                + " in persistent T265 session frame; last received pose, not time-aligned; aperture metres.",
                 "invalid_values": "If pose_valid=0, position/orientation must not be used. Missing pose uses identity. If width_valid=0, aperture=0 is a placeholder, not a closed-jaw measurement.",
                 "timestamps": "LeRobot nominal FPS timestamps index captured RGB frames; observation.sensor_time preserves actual exposure/arrival times. No missing frames are filled.",
                 "action_semantics": "No action feature: calibration, synchronization, retargeting and training action construction remain separate.",
@@ -98,6 +107,7 @@ def run(root, repo_id, task, source, replies):
     )
     log = None
     count = low = invalid_width = 0
+    width_reasons = Counter()
     extras = None
     failed = False
 
@@ -117,6 +127,7 @@ def run(root, repo_id, task, source, replies):
                         "frames": count,
                         "low_confidence_frames": low,
                         "invalid_width_frames": invalid_width,
+                        "invalid_width_reasons": dict(width_reasons),
                         "interrupted": interrupted,
                         "quality_validated": False,
                     },
@@ -131,8 +142,10 @@ def run(root, repo_id, task, source, replies):
             frames=count,
             low_confidence_frames=low,
             invalid_width_frames=invalid_width,
+            invalid_width_reasons=dict(width_reasons),
         )
         count = low = invalid_width = 0
+        width_reasons.clear()
 
     try:
         reply(event="ready")
@@ -180,6 +193,10 @@ def run(root, repo_id, task, source, replies):
                     count += 1
                     low += int(quality[0] < 3)
                     invalid_width += int(quality[2] == 0)
+                    if quality[2] == 0:
+                        width_reasons[
+                            item.get("width_error", "Unknown width failure")
+                        ] += 1
                 elif item["kind"] == "depth":
                     depth = item.pop("depth")
                     path = f"depth/{item['frame_number']:08d}.npz"

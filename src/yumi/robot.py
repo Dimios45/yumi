@@ -27,6 +27,8 @@ class KarmaModel:
         import mujoco
 
         self.mj = mujoco
+        self.arm_xml = Path(arm_xml).resolve()
+        self.karma_root = Path(karma_root).resolve()
         source = Path(karma_root) / "src/vr_teleop_kit/ik/model.py"
         spec = importlib.util.spec_from_file_location("yumi_karma_model", source)
         module = importlib.util.module_from_spec(spec)
@@ -82,7 +84,20 @@ class KarmaModel:
                 )
                 for g in (c.geom1, c.geom2)
             }
-            return names == {"base", "link1"}
+            if names == {"base", "link1"}:
+                return True
+            # Newer MJCFs put the base mesh directly in world. Only exclude
+            # the named base/link1 meshes, never arbitrary world/link1 contact.
+            meshes = {
+                self.mj.mj_id2name(
+                    self.model,
+                    self.mj.mjtObj.mjOBJ_MESH,
+                    int(self.model.geom_dataid[g]),
+                )
+                for g in (c.geom1, c.geom2)
+                if self.model.geom_type[g] == self.mj.mjtGeom.mjGEOM_MESH
+            }
+            return names == {"world", "link1"} and meshes == {"base", "link1"}
 
         return [
             (int(c.geom1), int(c.geom2), float(c.dist))

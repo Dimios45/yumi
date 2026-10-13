@@ -157,20 +157,37 @@ class Markers:
 
     def width(self, rgb):
         distance, error, centers = self.measurement(rgb)
+        width = self.opening_from_separation(distance, list(rgb.shape[:2][::-1]))
+        return width, error, centers
+
+    def opening_from_separation(self, distance, resolution):
+        """Map one retained marker measurement; never extend calibration bounds."""
+        if not np.isfinite(distance):
+            raise ValueError("Nonfinite marker separation")
         if self.c.get("width_method", "metric_pnp") == "image_calibrated":
             model = self.c.get("image_width_calibration")
             if model is None:
                 raise ValueError(
                     "Run width-sample and fit-width for image-space opening calibration"
                 )
-            if list(rgb.shape[:2][::-1]) != model["resolution"]:
+            if list(resolution) != model["resolution"]:
                 raise ValueError("Resolution differs from opening calibration")
             lo, hi = model["separation_range_px"]
-            if not lo <= distance <= hi:
+            tolerance = model.get("endpoint_tolerance_px", 0.0)
+            if not np.isfinite(tolerance) or not 0 <= tolerance <= 2:
+                raise ValueError("Invalid endpoint tolerance")
+            if not lo - tolerance <= distance <= hi + tolerance:
                 raise ValueError("Marker separation outside measured calibration range")
-            width = model["gain_m_per_px"] * distance + model["offset_m"]
+            distance = float(np.clip(distance, lo, hi))
+            if model.get("model") == "piecewise_linear":
+                x, y = np.asarray(model["separation_knots_px"]), np.asarray(model["opening_knots_m"])
+                if x.shape != y.shape or len(x) < 2 or not np.isfinite([x,y]).all() or np.any(np.diff(x) <= 0) or np.any(np.diff(y) <= 0):
+                    raise ValueError("Invalid monotonic opening lookup")
+                width = float(np.interp(distance, x, y))
+            else:
+                width = model["gain_m_per_px"] * distance + model["offset_m"]
         else:
             width = self.c["width_gain"] * distance + self.c["width_offset_m"]
         if not self.c["width_range_m"][0] <= width <= self.c["width_range_m"][1]:
             raise ValueError("Aperture outside calibrated range")
-        return width, error, centers
+        return width

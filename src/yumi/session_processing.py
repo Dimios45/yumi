@@ -63,6 +63,7 @@ def prepare_session(
     horizon=16,
     allow_provisional=False,
     task=None,
+    use_recorded_widths=False,
 ):
     root, output = Path(root).resolve(), Path(output).resolve()
     if history < 1 or horizon < 1:
@@ -80,6 +81,8 @@ def prepare_session(
     for key in ["rgb_serial", "tracking_serial", "resolution"]:
         if c[key] != meta["config"][key]:
             raise ValueError(f"Calibration mismatch: {key}")
+    if use_recorded_widths and c["markers"] != meta["config"]["markers"]:
+        raise ValueError("Recorded widths require the identical capture marker calibration")
     verified = bool(c.get("calibration_verified") and c.get("timing_verified"))
     output.mkdir(parents=True)
     report = {
@@ -90,6 +93,7 @@ def prepare_session(
         "training_ready": False,
         "episodes": [],
         "note": "Valid chunks certify software gates only, not physical calibration or robot feasibility.",
+        "width_source": "validated original capture measurements" if use_recorded_widths else "re-detection from compressed video",
     }
     detector = Markers(c["markers"], meta["rgb_intrinsics"])
     videos = iter(video_frames(root))
@@ -168,9 +172,19 @@ def prepare_session(
                     )
                 except ValueError as e:
                     reasons.append(str(e))
-            # Re-detect using the selected calibration: no zero filling or width extrapolation.
+            # Original pixel measurements avoid losses introduced by H.264 compression.
+            # Reuse is explicit and requires identical capture/calibration settings.
             try:
-                width, _, _ = detector.width(rgb)
+                if use_recorded_widths:
+                    measurement = row.get("marker_measurement")
+                    recorded = row.get("width_measurement", {})
+                    if not recorded.get("valid") or not measurement or measurement.get("units") != "px":
+                        raise ValueError("Original capture width is invalid or missing")
+                    width = detector.opening_from_separation(measurement["separation"], c["resolution"])
+                    if not np.isfinite(width) or not np.isclose(width, recorded["opening_m"], atol=1e-6, rtol=0):
+                        raise ValueError("Recorded width disagrees with capture calibration")
+                else:
+                    width, _, _ = detector.width(rgb)
             except ValueError as e:
                 reasons.append(str(e))
             if a is not None:

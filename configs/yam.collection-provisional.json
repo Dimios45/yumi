@@ -1,0 +1,10 @@
+{
+  "initial_joints_rad": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+  "T_capture_tcp_robot_tool": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+  "workspace_m": null,
+  "max_joint_speed_rad_s": 0.5,
+  "max_joint_accel_rad_s2": 2.0,
+  "registration_verified": false,
+  "hardware_verified": false,
+  "notes": "Offline provisional retargeting only: each capture starts at YAM home (six zero arm angles, matching the installed Yam_01 home_pos). Capture/robot grasp axes are assumed equal. Replace with measured registration/start pose/workspace before physical validation. Seventh dataset component is jaw aperture in metres, not a motor command."
+}
