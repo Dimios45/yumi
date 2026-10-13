@@ -56,7 +56,7 @@ def homogeneous(rotation, translation=(0., 0., 0.)):
     return a
 
 
-def load_capture(root, min_confidence, max_gap, rate):
+def load_capture(root, min_confidence, max_gap, rate, diagnostic=False):
     """Resample tracker poses onto a uniform grid; invalid where tracking is weak or gapped."""
     meta = json.loads((root/'metadata.json').read_text())
     rows = [json.loads(line) for line in (root/'samples.jsonl').read_text().splitlines()]
@@ -70,9 +70,9 @@ def load_capture(root, min_confidence, max_gap, rate):
     if np.any(np.diff(tp) <= 0):
         raise ValueError('Non-monotonic tracker timestamps.')
     confident = np.array([r['tracker_confidence'] >= min_confidence for r in poses])
-    if not confident.any():
+    if not confident.any() and not diagnostic:
         raise ValueError(f'No tracker sample reaches confidence {min_confidence}.')
-    t0 = tp[np.argmax(confident)]
+    t0 = tp[0] if diagnostic else tp[np.argmax(confident)]
     grid = np.arange(t0, tp[-1], 1/rate)
     position = np.array([r['position'] for r in poses])
     slerp = Slerp(tp, Rotation.from_quat([r['quaternion_xyzw'] for r in poses]))
@@ -193,12 +193,17 @@ def pose_error(target, actual):
                 target[:3, :3] @ actual[:3, :3].T).as_rotvec()))))
 
 
-def solve(capture, tracker_tcp, mode, rate, ik_hz, mu, anchor=None, inner=None):
+def solve(capture, tracker_tcp, mode, rate, ik_hz, mu, anchor=None, inner=None, initial_joints=None):
     """Drive the deployment follower through every target; return per-sample results and a report."""
     meta, images, times, grid, world_tracker, valid, image_times, widths = capture
     solver = DecoupledIKSolver(mu=mu, max_dq_per_joint=MAX_DQ)
-    follower = EEFollower(solver, freq=ik_hz, q_init=READY, gripper_max_speed=3.)
-    pos, quat = solver.fk(READY)
+    initial_joints = np.asarray(READY if initial_joints is None else initial_joints, float)
+    if (initial_joints.shape != (6,) or not np.isfinite(initial_joints).all()
+            or np.any(initial_joints < solver.joint_limits[:, 0])
+            or np.any(initial_joints > solver.joint_limits[:, 1])):
+        raise ValueError('Initial state must be six finite joint angles within model limits')
+    follower = EEFollower(solver, freq=ik_hz, q_init=initial_joints, gripper_max_speed=3.)
+    pos, quat = solver.fk(initial_joints)
     home = homogeneous(Rotation.from_quat(quat[[1, 2, 3, 0]]).as_matrix(), pos)
     world_tcp = world_tracker @ tracker_tcp
     if mode == 'gravity' or (mode == 'world' and anchor is None):
@@ -220,7 +225,9 @@ def solve(capture, tracker_tcp, mode, rate, ik_hz, mu, anchor=None, inner=None):
 
     first = int(np.argmax(valid))
     command(first)
-    for _ in range(int(3*ik_hz)):  # settle onto the start pose before t=0, as a rollout would
+    # Relative mapping already places the first target at FK(initial_joints).
+    # Settling would introduce posture-bias drift before the requested start.
+    for _ in range(0 if mode == 'relative' else int(3*ik_hz)):
         follower.step()
     settle_error = pose_error(targets[first], achieved())
     substeps = max(1, round(ik_hz/rate))
@@ -228,7 +235,7 @@ def solve(capture, tracker_tcp, mode, rate, ik_hz, mu, anchor=None, inner=None):
     for i in range(len(grid)):
         width = command(i) if valid[i] else None
         singular = gimbal = pressure = 0.
-        for _ in range(substeps):
+        for _ in range(0 if mode == 'relative' and i <= first else substeps):
             follower.step()
             singular = max(singular, solver.last_singularity_proximity)
             gimbal = max(gimbal, solver.last_wrist_gimbal_proximity)
@@ -254,6 +261,9 @@ def solve(capture, tracker_tcp, mode, rate, ik_hz, mu, anchor=None, inner=None):
     measured = [w for w in widths if w is not None]
     tracked = (pe <= POS_OK_MM) & (re <= ROT_OK_DEG)
     report = {
+        'initial_joints_rad': initial_joints.tolist(),
+        'T_base_initial_tool': home.tolist(),
+        'relative_mapping_formula': 'T_base_tool(0) @ inverse(T_world_tcp(0)) @ T_world_tcp(t)' if mode == 'relative' else None,
         'mapping': mode,
         'anchor_xyz_m_yaw_deg': None if mode == 'relative' else [round(v, 4) for v in anchor],
         'T_tracker_tcp': tracker_tcp.round(6).tolist(),
@@ -300,6 +310,8 @@ def tracker_tcp_from(rotation, offset, tweak_deg):
 
 
 def summary_markdown(report):
+    if 'comparison_summary' in report:
+        return report['comparison_summary']
     pe, re = report['position_error_mm'], report['rotation_error_deg']
     w = report['width']
     workspace_line = (f"\n\nInside inner workspace **{report['inner_workspace_fraction']*100:.0f}%**"
@@ -451,6 +463,11 @@ def serve(args, capture, state, tracker_rotation, world_calib, space):
         offsets = [server.gui.add_slider(f'TCP offset {axis} (cm, tracker frame)', min=-30., max=30.,
                    step=.5, initial_value=float(v*100)) for axis, v in zip('xyz', args.tcp_offset)]
         resolve = server.gui.add_button('Re-solve IK')
+        if getattr(args, 'fixed_smooth_comparison', False):
+            resolve.disabled = True
+            mode.disabled = True
+            for control in [*tweaks, *offsets]:
+                control.disabled = True
         summary = server.gui.add_markdown(summary_markdown(state['report']))
     commands = queue.SimpleQueue()
     timeline.on_update(lambda event: commands.put(('seek', timeline.value)) if event.client is not None else None)
@@ -468,7 +485,7 @@ def serve(args, capture, state, tracker_rotation, world_calib, space):
                                            [t.value for t in tweaks])
             anchor = [a.value for a in anchor_sliders] if aligned and mode.value == 'world' else None
             samples, report = solve(capture, tracker_tcp, mode.value, args.rate, args.ik_hz, args.mu,
-                                    anchor, state.get('inner'))
+                                    anchor, state.get('inner'), args.initial_joints)
             state.update(samples=samples, report=report)
             if aligned and report['anchor_xyz_m_yaw_deg']:
                 for slider, v in zip(anchor_sliders, report['anchor_xyz_m_yaw_deg']):
@@ -486,6 +503,8 @@ def serve(args, capture, state, tracker_rotation, world_calib, space):
         client.camera.look_at = (.25, 0, .3)
         client.camera.up_direction = (0, 0, 1)
 
+    if state.get('on_viewer_ready') is not None:
+        state['on_viewer_ready'](server)
     print(f'YAM replay: http://127.0.0.1:{args.port} (Ctrl-C to stop)', flush=True)
     position, previous, last_index, last_camera = 0., time.monotonic(), -1, None
     last_world = None
@@ -520,7 +539,7 @@ def serve(args, capture, state, tracker_rotation, world_calib, space):
     rotations = {'0°': None, '90° clockwise': cv2.ROTATE_90_CLOCKWISE, '180°': cv2.ROTATE_180,
                  '90° counterclockwise': cv2.ROTATE_90_COUNTERCLOCKWISE}
     try:
-        while True:
+        while not (state.get('stop_event') is not None and state['stop_event'].is_set()):
             now = time.monotonic()
             elapsed, previous = min(now-previous, .1), now
             if playing.value and server.get_clients():
@@ -558,14 +577,18 @@ def serve(args, capture, state, tracker_rotation, world_calib, space):
                 timeline.value = float(position)
                 if sample['valid']:
                     width = 'n/a' if sample['width'] is None else f'{sample["width"]*1000:.0f} mm'
-                    flags = [name for name, v in (('gimbal', sample['gimbal']), ('shoulder', sample['singularity']))
-                             if v > .5] + (['joint limit'] if sample['limit_pressure'] > 1e-6 else [])
-                    status.content = (f'**{position:.2f} / {duration:.2f} s** · '
+                    flags = [name for name, v in (('gimbal', sample.get('gimbal')), ('shoulder', sample.get('singularity')))
+                             if v is not None and v > .5] + (['joint limit'] if sample.get('limit_pressure', 0) > 1e-6 else [])
+                    phase = ('APPROACH · ' if position < state['report'].get('approach_duration_s', 0) else
+                             'RECORDED MOTION · ' if 'approach_duration_s' in state['report'] else '')
+                    status.content = (f'**{phase}{position:.2f} / {duration:.2f} s** · '
                         f'error **{sample["position_error_mm"]:.1f} mm** / '
                         f'**{sample["rotation_error_deg"]:.1f}°**\n\n'
                         f'Jaw {width}' + (f' · ⚠ {", ".join(flags)}' if flags else ''))
                 else:
-                    status.content = f'**{position:.2f} s** · tracker confidence low or gap — arm holds'
+                    status.content = (f'**{position:.2f} s · UNVERIFIED TRACKING** — diagnostic simulation only'
+                                      if state['report'].get('diagnostic_tracking') else
+                                      f'**{position:.2f} s** · tracker confidence low or gap — arm holds')
                 key = (sample['image'], camera_rotation.value)
                 if sample['image'] is not None and key != last_camera:
                     rgb = cv2.cvtColor(cv2.imread(str(args.capture/images[sample['image']]['rgb_path'])),
@@ -603,6 +626,9 @@ def main():
                         help='yumi config with T_tracker_tcp and marker width calibration')
     parser.add_argument('--mapping', choices=('relative', 'gravity', 'world'), default='gravity',
                         help='world uses the saved session anchor (world_anchor.json) when present')
+    parser.add_argument('--initial-joints', type=float, nargs=6, default=READY.tolist(),
+                        help='Virtual initial arm angles in radians; use six zeros for zero-pose replay')
+    parser.add_argument('--no-world', action='store_true', help='Omit overhead/table registration for relative comparison')
     parser.add_argument('--world-calib', type=Path, default=ROOT/'configs/world_camera.json',
                         help='World camera calibration from scripts/calibrate_world.py')
     parser.add_argument('--tcp-offset', type=float, nargs=3, default=(0., 0., 0.), metavar=('X', 'Y', 'Z'),
@@ -627,14 +653,15 @@ def main():
         args.capture, min_confidence, config.get('max_pose_gap_s', .025), args.rate)
     if config.get('T_tracker_tcp') is not None:
         measured = np.asarray(config['T_tracker_tcp'], dtype=float)
-        tracker_rotation, args.tcp_offset, tcp_source = measured[:3, :3], measured[:3, 3], 'measured (config)'
+        tracker_rotation, args.tcp_offset = measured[:3, :3], measured[:3, 3]
+        tcp_source = 'verified config' if config.get('calibration_verified') else 'PROVISIONAL config — physical TCP unverified'
     else:
         tracker_rotation, tcp_source = R_TRACKER_TCP_ASSUMED, 'ASSUMED — not calibrated'
     image_times = np.array([r['device_s'] for r in images])+config.get('camera_time_offset_s', 0.)
     widths = ([None]*len(images) if args.no_width
               else measure_widths(args.capture, images, meta, config.get('markers', meta['config']['markers'])))
     capture = (meta, images, times, grid, world_tracker, valid, image_times, widths)
-    world_calib = json.loads(args.world_calib.read_text()) if args.world_calib.exists() else None
+    world_calib = json.loads(args.world_calib.read_text()) if not args.no_world and args.world_calib.exists() else None
     space, inner, anchor = None, None, None
     if world_calib:
         space = workspace(DecoupledIKSolver(), world_calib['base']['z_m'])
@@ -647,7 +674,7 @@ def main():
             args.mount_tweak, args.tcp_offset = saved['mount_tweak_deg'], saved['tcp_offset_m']
             tcp_source += f' · mount tweak {args.mount_tweak}° from {session.name}'
     tracker_tcp = tracker_tcp_from(tracker_rotation, np.asarray(args.tcp_offset), args.mount_tweak)
-    samples, report = solve(capture, tracker_tcp, args.mapping, args.rate, args.ik_hz, args.mu, anchor, inner)
+    samples, report = solve(capture, tracker_tcp, args.mapping, args.rate, args.ik_hz, args.mu, anchor, inner, args.initial_joints)
     report = {'capture': str(args.capture.resolve()), 'T_tracker_tcp_source': tcp_source,
               'min_tracker_confidence': min_confidence, **report}
     print(json.dumps(report, indent=2), flush=True)

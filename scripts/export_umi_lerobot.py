@@ -7,6 +7,11 @@ Run with karma's environment (LeRobot 0.6.1):
         ../yumi/data/raw/session-02 --repo-id vruga/yumi-umi-block-place \\
         --task "pick up the green block and place it on the wooden board" --push
 
+Several sources may be given; each is a raw session (episode-NNN folders with PNGs)
+or a `yumi record-session` dataset (extras/episode_NNNNNN + video). For the latter the
+marker separation measured live on the uncompressed frame is used, so widths follow
+the same calibration as raw sessions. --skip takes episode names, or SOURCE/NAME.
+
 Observation and action design follows the UMI policy interface:
 
 * Latency matching (PD1.1): the wrist RGB frame is the timing reference; the
@@ -93,8 +98,47 @@ def width_model(samples_path, exclude_mm):
             'source': str(samples_path)}
 
 
-def load_episode(root, config, widths_cal, tracker_tcp, min_confidence, max_gap, with_world):
-    meta = json.loads((root/'metadata.json').read_text())
+class SessionVideo:
+    """Frames of one record-session episode, read in order from the concatenated video."""
+
+    def __init__(self, path, start):
+        self.path, self.start, self.cap, self.next = path, start, None, None
+
+    def __call__(self, i):
+        if self.cap is None or i < self.next:
+            if self.cap is not None:
+                self.cap.release()
+            self.cap = cv2.VideoCapture(str(self.path))
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.start+i)
+            self.next = i
+        while True:
+            ok, bgr = self.cap.read()
+            if not ok:
+                raise ValueError(f'{self.path}: video ends before frame {self.start+i}')
+            self.next += 1
+            if self.next-1 == i:
+                return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+
+def session_episodes(root):
+    """(episode dir, SessionVideo) for a record-session dataset; videos hold episodes back to back."""
+    videos = sorted((root/'videos').rglob('*.mp4'))
+    if len(videos) != 1:
+        raise SystemExit(f'{root}: expected one video file, found {len(videos)}')
+    count = int(cv2.VideoCapture(str(videos[0])).get(cv2.CAP_PROP_FRAME_COUNT))
+    out, start = [], 0
+    for ex in sorted((root/'extras').glob('episode_*')):
+        out.append((ex, SessionVideo(videos[0], start)))
+        start += sum('"kind": "image"' in line for line in (ex/'samples.jsonl').open())
+    if start != count:
+        raise SystemExit(f'{root}: {start} image samples but {count} video frames')
+    return out
+
+
+def load_episode(root, config, widths_cal, tracker_tcp, min_confidence, max_gap, with_world, video=None,
+                 max_step=None, min_keep=0.):
+    session_format = video is not None
+    meta = json.loads(((root.parents[1]/'session.json') if session_format else (root/'metadata.json')).read_text())
     rows = [json.loads(line) for line in (root/'samples.jsonl').read_text().splitlines()]
     images = [r for r in rows if r['kind'] == 'image']
     poses = [r for r in rows if r['kind'] == 'pose']
@@ -116,6 +160,18 @@ def load_episode(root, config, widths_cal, tracker_tcp, min_confidence, max_gap,
     keep = np.arange(first, last+1)
     alpha = ((ti[keep]-tp[left[keep]])/(tp[right[keep]]-tp[left[keep]]))[:, None]
     position = np.array([r['position'] for r in poses])
+    jumps, jump_trimmed = [], 0
+    if max_step is not None:  # T265 relocalisation: one-frame position jumps faster than a hand moves
+        p = (1-alpha)*position[left[keep]]+alpha*position[right[keep]]
+        step = np.linalg.norm(np.diff(p, axis=0), axis=1)
+        jumps = np.flatnonzero(step > max_step)
+        edges = np.r_[0, jumps+1, len(keep)]
+        k = int(np.argmax(np.diff(edges)))
+        if np.diff(edges)[k] < min_keep*len(keep):
+            raise ValueError(f'pose jumps at frames {jumps.tolist()} leave only '
+                             f'{np.diff(edges)[k]}/{len(keep)} continuous frames')
+        jump_trimmed = len(keep)-int(np.diff(edges)[k])
+        keep, alpha = keep[edges[k]:edges[k+1]], alpha[edges[k]:edges[k+1]]
     world_tracker = np.tile(np.eye(4), (len(keep), 1, 1))
     world_tracker[:, :3, 3] = (1-alpha)*position[left[keep]]+alpha*position[right[keep]]
     world_tracker[:, :3, :3] = Slerp(tp, Rotation.from_quat([r['quaternion_xyzw'] for r in poses]))(
@@ -131,8 +187,12 @@ def load_episode(root, config, widths_cal, tracker_tcp, min_confidence, max_gap,
             return detector.image_separation(rgb)[0]
         except ValueError:
             return np.nan
-    with ThreadPoolExecutor() as pool:
-        px = np.array(list(pool.map(separation, [images[i] for i in keep])))
+    if session_format:  # measured live on the uncompressed frame by the same detector
+        px = np.array([(images[i].get('marker_measurement') or {}).get('separation') or np.nan
+                       for i in keep], float)
+    else:
+        with ThreadPoolExecutor() as pool:
+            px = np.array(list(pool.map(separation, [images[i] for i in keep])))
     measured = np.isfinite(px)
     if not measured.any():
         raise ValueError('jaw markers never detected')
@@ -146,9 +206,15 @@ def load_episode(root, config, widths_cal, tracker_tcp, min_confidence, max_gap,
         world_rows = [r for r in rows if r['kind'] == 'world']
         tw = np.array([r['device_s'] for r in world_rows])
         world = [world_rows[int(np.abs(tw-x).argmin())] for x in t]
-    return {'root': root, 'times': t-t[0], 'pose': episode_tcp, 'width': width, 'measured': measured,
-            'images': [images[i] for i in keep], 'world': world,
+    if session_format:
+        rgb = lambda i: video(int(keep[i]))
+    else:
+        rgb = lambda i: cv2.cvtColor(cv2.imread(str(root/images[keep[i]]['rgb_path'])), cv2.COLOR_BGR2RGB)
+    return {'root': root, 'name': f'{root.parents[1].name}/{root.name}' if session_format else root.name,
+            'times': t-t[0], 'pose': episode_tcp, 'width': width, 'measured': measured,
+            'rgb': rgb, 'world': world,
             'stats': {'frames': len(keep), 'trimmed_frames': len(images)-len(keep),
+                      'pose_jumps': len(jumps), 'jump_trimmed_frames': jump_trimmed,
                       'width_measured_fraction': float(measured.mean()),
                       'longest_width_gap_frames': int(gaps.max()),
                       'width_extrapolated_fraction': float(((px < lo) | (px > hi))[measured].mean()),
@@ -172,7 +238,8 @@ def frames(ep, obs_step):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('session', type=Path, help='Session directory with episode-NNN folders')
+    parser.add_argument('session', type=Path, nargs='+',
+                        help='Raw session(s) with episode-NNN folders, and/or record-session datasets')
     parser.add_argument('--repo-id', required=True)
     parser.add_argument('--task', required=True, help='Language instruction stored with every frame')
     parser.add_argument('--root', type=Path, help='Output folder (default data/lerobot/<repo name>)')
@@ -184,6 +251,13 @@ def main():
     parser.add_argument('--min-seconds', type=float, default=4.)
     parser.add_argument('--obs-step', type=int, default=3,
                         help='Frames between the two observation steps (3 at 30 fps = 10 Hz history)')
+    parser.add_argument('--max-step-mm', type=float,
+                        help='Pose jump threshold per frame; cut to the longest jump-free stretch '
+                             '(e.g. 67 = max_speed_m_s 2.0 at 30 fps). Default: no check')
+    parser.add_argument('--min-keep-fraction', type=float, default=.7,
+                        help='--max-step-mm: drop an episode whose longest clean stretch is shorter')
+    parser.add_argument('--max-width-gap-frames', type=int,
+                        help='Drop episodes whose jaw width is undetected for longer than this. Default: no check')
     parser.add_argument('--with-world', action='store_true', help='Also store the overhead camera video')
     parser.add_argument('--push', action='store_true', help='Upload to the Hugging Face Hub')
     parser.add_argument('--public', action='store_true', help='Make the Hub dataset public (default private)')
@@ -204,30 +278,44 @@ def main():
         raise FileExistsError(f'{root} exists; remove it or pass --root')
 
     episodes, skipped = [], {}
-    for path in sorted(args.session.glob('episode-*')):
-        if path.name in args.skip:
-            skipped[path.name] = 'skipped by request'
-        elif not (path/'COMPLETE').exists() or (path/'FAILED.txt').exists():
-            skipped[path.name] = 'incomplete capture'
+    for source in args.session:
+        if (source/'extras').is_dir():
+            if args.with_world:
+                raise SystemExit(f'{source}: record-session data has no world camera')
+            if json.loads((source/'session.json').read_text())['config'].get('markers') != config['markers']:
+                raise SystemExit(f'{source}: recorded with different marker settings than {args.config}')
+            items = [(ex, f'{source.name}/{ex.name}', video) for ex, video in session_episodes(source)]
         else:
-            try:
-                ep = load_episode(path, config, cal, tracker_tcp, config.get('min_tracker_confidence', 3),
-                                  config.get('max_pose_gap_s', .025), args.with_world)
-            except ValueError as exc:
-                skipped[path.name] = str(exc)
-                continue
-            if ep['times'][-1] < args.min_seconds:
-                skipped[path.name] = f'shorter than {args.min_seconds:g} s'
-                continue
-            episodes.append(ep)
-            print(f'{path.name}: {json.dumps(ep["stats"])}', flush=True)
+            items = [(path, path.name, None) for path in sorted(source.glob('episode-*'))]
+        for path, name, video in items:
+            if name in args.skip or path.name in args.skip and video is None:
+                skipped[name] = 'skipped by request'
+            elif video is None and (not (path/'COMPLETE').exists() or (path/'FAILED.txt').exists()):
+                skipped[name] = 'incomplete capture'
+            else:
+                try:
+                    ep = load_episode(path, config, cal, tracker_tcp, config.get('min_tracker_confidence', 3),
+                                      config.get('max_pose_gap_s', .025), args.with_world, video,
+                                      args.max_step_mm and args.max_step_mm/1000, args.min_keep_fraction)
+                except ValueError as exc:
+                    skipped[name] = str(exc)
+                    continue
+                gap = ep['stats']['longest_width_gap_frames']
+                if args.max_width_gap_frames is not None and gap > args.max_width_gap_frames:
+                    skipped[name] = f'jaw width undetected for {gap} frames in a row'
+                    continue
+                if ep['times'][-1] < args.min_seconds:
+                    skipped[name] = f'shorter than {args.min_seconds:g} s'
+                    continue
+                episodes.append(ep)
+                print(f'{name}: {json.dumps(ep["stats"])}', flush=True)
     for name, reason in skipped.items():
         print(f'{name}: SKIPPED ({reason})', flush=True)
     if not episodes:
         raise SystemExit('No episodes to export.')
 
     fps = config['fps']
-    h, w = cv2.imread(str(episodes[0]['root']/episodes[0]['images'][0]['rgb_path'])).shape[:2]
+    h, w = episodes[0]['rgb'](0).shape[:2]
     video = {'dtype': 'video', 'shape': (h, w, 3), 'names': ['height', 'width', 'channels']}
     features = {
         'observation.images.wrist': video,
@@ -245,22 +333,23 @@ def main():
                                     rgb_encoder=RGBEncoderConfig(preset=10))
     for number, ep in enumerate(episodes):
         for i, frame in frames(ep, args.obs_step):
-            frame['observation.images.wrist'] = cv2.cvtColor(
-                cv2.imread(str(ep['root']/ep['images'][i]['rgb_path'])), cv2.COLOR_BGR2RGB)
+            frame['observation.images.wrist'] = ep['rgb'](i)
             if args.with_world:
                 frame['observation.images.world'] = cv2.cvtColor(
                     cv2.imread(str(ep['root']/ep['world'][i]['rgb_path'])), cv2.COLOR_BGR2RGB)
             frame['task'] = args.task
             dataset.add_frame(frame)
         dataset.save_episode()
-        print(f'saved {number+1}/{len(episodes)} ({ep["root"].name})', flush=True)
+        print(f'saved {number+1}/{len(episodes)} ({ep["name"]})', flush=True)
     dataset.finalize()
 
     export = {
-        'source_session': str(args.session.resolve()),
-        'episodes': [ep['root'].name for ep in episodes], 'skipped': skipped,
-        'per_episode': {ep['root'].name: ep['stats'] for ep in episodes},
+        'source_session': [str(s.resolve()) for s in args.session],
+        'episodes': [ep['name'] for ep in episodes], 'skipped': skipped,
+        'per_episode': {ep['name']: ep['stats'] for ep in episodes},
         'fps': fps, 'obs_step_frames': args.obs_step,
+        'filters': {'max_step_mm': args.max_step_mm, 'min_keep_fraction': args.min_keep_fraction,
+                    'max_width_gap_frames': args.max_width_gap_frames, 'min_seconds': args.min_seconds},
         'T_tracker_tcp': tracker_tcp.round(6).tolist(), 'T_tracker_tcp_source': tcp_source,
         'camera_time_offset_s': config.get('camera_time_offset_s', 0.),
         'width_calibration': cal,

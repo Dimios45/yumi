@@ -1,0 +1,23 @@
+{
+ "session": "/home/yambox/yumi/data/lerobot/session-20261008-000612",
+ "cube": [
+  0.3954,
+  0.1024
+ ],
+ "table_z": 0.0,
+ "grasp_height": 0.015,
+ "tcp_config": "/home/yambox/yumi/data/lerobot/yumi-block-stack-20261008-training/meta/processing-config.json",
+ "tool_roll_deg": 0.0,
+ "arm": "right",
+ "interface": "can_right",
+ "serial": "352122271723",
+ "exec_latency": 0.1,
+ "ik": "smooth",
+ "lift": 0.06,
+ "transit": 0.06,
+ "max_ik_miss": 25.0,
+ "min_z": 0.01,
+ "start_from_session": 4,
+ "saved_from": "session replay session-20261008-000612 episode 4",
+ "saved": "2026-10-09 16:56:40"
+}

@@ -31,7 +31,8 @@ def _T(pos, R):
 class PoseIK:
     """Damped least-squares IK on the tool0 site, solved to convergence, with a posture prior."""
 
-    def __init__(self, q_pref, rot_weight=.3, posture=1e-6, damping=1e-4, margin=.03, iters=80):
+    def __init__(self, q_pref, rot_weight=.3, posture=1e-6, damping=1e-4, margin=.03, iters=80, elbow_min=None,
+                 max_tilt_deg=35.):
         from vr_teleop_kit.ik.decoupled_ik import DecoupledIKSolver
 
         self.solver = DecoupledIKSolver()  # used only for its model, tool0 site and FK
@@ -47,6 +48,10 @@ class PoseIK:
         # the previous solution; the prior is only a tie-breaker near singularities/unreachable targets.
         self.mu = posture*np.array([1., 1., 1., .3, .1, .1])
         self.damping, self.iters = damping, iters
+        # Elbow assist: a 6-DoF pose fixes the posture, so a low target with a flat tool can only be
+        # reached with the shoulder thrown forward and the elbow straight. Like the demonstrating hand,
+        # pitch the approach axis further down (about the tool point) just enough to keep the elbow bent.
+        self.elbow_min, self.max_tilt_deg, self.last_tilt_deg = elbow_min, max_tilt_deg, 0.
         self.jacp, self.jacr = np.zeros((3, self.model.nv)), np.zeros((3, self.model.nv))
 
     def fk(self, q):
@@ -64,6 +69,14 @@ class PoseIK:
         Exact pose first; if the position cannot be met that way (the orientation is out of reach
         there), solve again with position first and the orientation as close as the arm allows.
         """
+        self.last_tilt_deg = 0.
+        q, mm, deg = self._solve_pose(T_target, q_seed)
+        while self.elbow_min is not None and q[2] < self.elbow_min and self.last_tilt_deg < self.max_tilt_deg:
+            self.last_tilt_deg += 2.5
+            q, mm, deg = self._solve_pose(tilt_down(T_target, self.last_tilt_deg), q)
+        return q, mm, deg
+
+    def _solve_pose(self, T_target, q_seed):
         q, mm, deg = self._solve(T_target, q_seed, self.w)
         if mm > 3.:
             q2, mm2, deg2 = self._solve(T_target, q, self.w_position_first)
@@ -92,6 +105,16 @@ class PoseIK:
         self.solver._fk(q)
         e = self._error(T_target)
         return q, float(np.linalg.norm(e[:3])*1000), float(np.degrees(np.linalg.norm(e[3:])))
+
+
+def tilt_down(T, deg):
+    """T with its approach axis (z) pitched `deg` further below horizontal, about the tool point."""
+    axis = np.cross(T[:3, 2], [0., 0., 1.])
+    if np.linalg.norm(axis) < 1e-6:
+        return T
+    out = np.array(T, float)
+    out[:3, :3] = Rotation.from_rotvec(-np.radians(deg)*axis/np.linalg.norm(axis)).as_matrix() @ out[:3, :3]
+    return out
 
 
 def lift_arc(T_from_, T_to, lift, n):
@@ -141,9 +164,10 @@ class Planner:
             transit = len(Ts)
         times += list(due)
         Ts += list(targets)
-        q, qs, pos, rot, cut = np.asarray(q_now, float), [], [], [], len(Ts)
+        q, qs, pos, rot, tilt, cut = np.asarray(q_now, float), [], [], [], [], len(Ts)
         for i, T in enumerate(Ts):
             q_new, mm, deg = self.ik.solve(T, q)
+            tilt.append(getattr(self.ik, 'last_tilt_deg', 0.))
             qs.append(q_new)
             pos.append(mm)
             rot.append(deg)
@@ -151,7 +175,7 @@ class Planner:
                 cut = i  # keep solving for the preview, but never stream past an unreachable target
             q = q_new
         out = {'times': np.asarray(times), 'q': np.asarray(qs), 'pos_mm': np.asarray(pos),
-               'rot_deg': np.asarray(rot), 'transit': transit, 'cut': cut, 'floored': floored,
+               'rot_deg': np.asarray(rot), 'tilt_deg': np.asarray(tilt), 'transit': transit, 'cut': cut, 'floored': floored,
                'targets': np.asarray(Ts)}
         out['achieved'] = np.array([self.ik.fk(qq) for qq in out['q']])
         out['ok'] = out['pos_mm'] <= 10.

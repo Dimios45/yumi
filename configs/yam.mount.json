@@ -1,0 +1,14 @@
+{
+ "tcp_offset_m": [
+  0.009000000000000001,
+  -0.073,
+  -0.10800000000000001
+ ],
+ "mount_tweak_deg": [
+  0.0,
+  0.0,
+  25.5
+ ],
+ "frame": "replay_yam.py convention: fingertips in the T265 frame",
+ "saved": "2026-10-08 15:38:58"
+}

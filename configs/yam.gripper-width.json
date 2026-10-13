@@ -1,0 +1,61 @@
+{
+  "arm": "right",
+  "interface": "can_right",
+  "date": "2026-10-11 18:02",
+  "points": [
+    {
+      "command": 1.0,
+      "measured": 0.9999278783798218,
+      "gap_mm": 97.0
+    },
+    {
+      "command": 0.875,
+      "measured": 0.8789758682250977,
+      "gap_mm": 85.0
+    },
+    {
+      "command": 0.75,
+      "measured": 0.7531192898750305,
+      "gap_mm": 72.5
+    },
+    {
+      "command": 0.625,
+      "measured": 0.6287053823471069,
+      "gap_mm": 61.0
+    },
+    {
+      "command": 0.5,
+      "measured": 0.5043634176254272,
+      "gap_mm": 49.0
+    },
+    {
+      "command": 0.375,
+      "measured": 0.37778565287590027,
+      "gap_mm": 37.0
+    },
+    {
+      "command": 0.25,
+      "measured": 0.2532273232936859,
+      "gap_mm": 25.0
+    },
+    {
+      "command": 0.125,
+      "measured": 0.12881341576576233,
+      "gap_mm": 14.0
+    },
+    {
+      "command": 0.0,
+      "measured": 0.024810658767819405,
+      "gap_mm": 5.0
+    }
+  ],
+  "block_touch": {
+    "command": 0.32,
+    "measured": 0.33097732067108154
+  },
+  "linear_fit": {
+    "gap_mm_at_closed": 2.833333333333344,
+    "gap_mm_at_open": 96.16666666666667,
+    "rms_mm": 0.9622504486493766
+  }
+}

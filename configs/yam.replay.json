@@ -1,0 +1,19 @@
+{
+ "session": "/home/yambox/yumi/data/lerobot/session-20261010-173857",
+ "table_z": 0.0,
+ "grasp_height": 0.015,
+ "tcp_config": "/home/yambox/yumi/data/lerobot/yumi-block-stack-20261008-training/meta/processing-config.json",
+ "tool_roll_deg": 0.0,
+ "arm": "right",
+ "interface": "can_right",
+ "serial": "352122271723",
+ "exec_latency": 0.1,
+ "ik": "smooth",
+ "lift": 0.06,
+ "transit": 0.06,
+ "max_ik_miss": 25.0,
+ "min_z": 0.01,
+ "start_from_session": 0,
+ "saved_from": "green block -> wooden board: session-20261010-173857 episode 0 (97% jaw width measured, no pose jumps); cube not placed yet",
+ "saved": "2026-10-10"
+}
