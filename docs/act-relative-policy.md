@@ -1,5 +1,37 @@
 # ACT relative-trajectory policy on YAM
 
+> **Current commands are in the [README](../README.md#6-robot-rollout).** The
+> current model is `vruga/pick-place-the-green-block-act-clip-relative` (ACT + CLIP,
+> 45 episodes). It runs with `--sync --steps-per-inference 50`, `--elbow-min 0.3`
+> and the measured `--gripper-calibration configs/yam.gripper-width.json`.
+> This page explains the policy inputs, outputs and control loop, plus the history of earlier runs.
+
+## Current aperture mapping (2026-10-10)
+
+The run history below describes earlier implementations, including a nominal
+95 mm robot opening. It is not physical gripper calibration. The current default
+`--umi-width-range 0 0.053` maps UMI travel to the robot's complete normalized
+travel; it does not preserve the demonstrated physical jaw gap.
+
+To preserve aperture in metres, inference now accepts
+`--gripper-calibration configs/yam.gripper-width.json`. This reads the measured
+`points` table produced by `scripts/measure_yam_gripper.py`, checks the selected
+arm and CAN interface, and requires at least three strictly monotonic points.
+It interpolates gap-to-command for actions and measured-feedback-to-gap for
+observations separately. Synthetic mapping tests do not validate a real arm.
+
+A measured table for the right arm is now in `configs/yam.gripper-width.json`
+(2026-10-11; 5–97 mm; the block is touched at command 0.32). Inference clamps
+widths and feedback to its measured ends, so predictions such as 59 mm don't fail.
+The legacy `--umi-width-range` is ignored when a measured table is selected.
+
+Raw-session command replay also now rejects internal tracking loss and missing
+adjacent jaw measurements. It no longer fills long width gaps or substitutes
+fully open when all widths are missing. Use offline replay to inspect incomplete
+recordings; rejection does not erase their valid data.
+
+## Historical trained-policy run
+
 This is the first policy trained on real UMI demonstrations from this rig that has
 run on the YAM arm. It is an LeRobot ACT model trained on handheld T265 + D405
 captures. At deployment it drives the **right** YAM arm through Karma, with the

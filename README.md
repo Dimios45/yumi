@@ -1,261 +1,544 @@
-# Custom UMI: D405 + T265, no ROS
+# yumi: handheld UMI demonstrations → policies on a YAM arm
 
-**Prepare calibration in one batch: [Print & Calibration Guide](CALIBRATION_PRINT_GUIDE.md)** — one A4 target sheet, physical checklist and commands.
+yumi records manipulation demonstrations with a **handheld gripper** that has a
+D405 wrist camera and a T265 tracker on it (a [UMI](https://umi-gripper.github.io/)-style
+rig without ROS). It turns them into **LeRobot v3** datasets of relative end-effector
+trajectories, trains ACT policies on them, and runs those policies on a **YAM arm**
+through [Karma](https://github.com/SRA-VJTI/karma).
 
-A local, uv-managed capture and calibration toolkit with Viser preview and an official **LeRobot v3.0** exporter. It uses the T265's onboard visual–inertial pose estimate, D405 RGB/depth, and two finger ArUco markers. It does not drive robot hardware.
+<p align="center">
+  <a href="assets/blog.mp4"><img src="assets/blog.gif" alt="Training demonstration next to the YAM arm running the ACT + CLIP policy" width="900"></a>
+</p>
+<p align="center"><sub>
+Left top: a training demonstration from the handheld gripper. Left bottom and right: the YAM arm running the
+ACT + CLIP policy, seen from its wrist D405 and the top D435. Real time, 18 s. Full-resolution videos: <a href="assets/blog.mp4">merged</a> · <a href="assets/rollout-top-wrist.mp4">top + wrist</a> · <a href="assets/training-demo.mp4">training demo</a>.
+</sub></p>
 
-**Single-arm Karma/YAM workflow:** [capture, relative action export and offline robot feasibility](docs/single-arm-umi.md).
-**ACT policy on the YAM arm:** [training, deployment, camera/proprioception inputs and inference commands](docs/act-relative-policy.md).
-The latest three-episode batch has no valid jaw-width labels because marker 13
-was not decoded. Fix that before collecting more training demonstrations. The
-recorder now requires valid width as well as tracking before an episode starts.
-
-**Status:** real D405 RGB/depth capture and Viser startup tested here; synthetic two-episode LeRobot export and full readback passed. T265 pose/IMU streaming and an overhead D435 snapshot are now tested; physical calibration remains pending. Marker scale, jaw geometry, tool extrinsics, timing, and physical tracking accuracy are not yet calibrated. Do not mark the example calibration verified until those measurements are complete. See [validation](docs/validation.md).
-
-## Compatibility
-
-| Component | Pin / decision | Reason |
+| Stage | What happens | Main command |
 |---|---|---|
-| Capture Python | CPython 3.10 | Legacy RealSense wheel ABI |
-| RealSense SDK / Python binding | librealsense 2.53.1 / `pyrealsense2==2.53.1.4623` | Includes D405 and T265; also the FastUMI recommendation |
-| Capture NumPy | 1.26.4 | Conservative legacy binary environment |
-| Capture OpenCV | opencv-python-headless 4.11.0.86 | Includes `cv2.aruco`; avoids competing packages overwriting `cv2` |
-| Viser | 1.0.16 | Local web preview, no ROS |
-| Export Python | CPython 3.10, separate uv environment | Keeps training/data dependencies away from acquisition |
-| Export | LeRobot 0.4.3, NumPy 2.2.6, CPU Torch 2.7.1 | LeRobot v3; its rerun dependency requires NumPy 2 |
-| Video | H.264 through LeRobot / PyAV | Tested encoding and complete readback; RGB originals remain lossless in raw captures |
+| [1. Calibrate](#2-calibration) | Jaw width from finger markers, YAM gripper gap table | `calibrate_width_four_points.py`, `measure_yam_gripper.py` |
+| [2. Collect](#3-data-collection) | Handheld demos: wrist video, T265 pose, jaw width | `yumi record-session` |
+| [3. Export](#4-export-to-lerobot) | UMI relative-trajectory LeRobot v3 dataset | `export_umi_lerobot.py` |
+| [4. Train](#5-training) | ACT / ACT + CLIP on 50-step relative chunks | `training/train_v2.py` |
+| [5. Roll out](#6-robot-rollout) | Policy drives the YAM arm, optionally recorded | `infer_act_relative.py live` |
+| [6. Record](#7-recording-a-rollout-video) | Demo + wrist + top camera merged into one video | `make_rollout_video.py` |
 
-**Do not upgrade the capture SDK to 2.54.1 or newer:** T265 support was removed. The 2.53.1 release says T265 is recognized but no longer manufacturer-tested. This is a compatible legacy baseline, not a promise of perfect tracking. D405 firmware observed here is **5.15.1.55**. No firmware was changed. A modern RealSense package installed elsewhere does not affect this project's uv environment; do not set `PYTHONPATH` or `LD_LIBRARY_PATH` to another SDK.
+---
 
-Sources: [RealSense 2.53.1 release](https://github.com/realsenseai/librealsense/releases/tag/v2.53.1), [SDK removal notes](https://github.com/realsenseai/librealsense/wiki/Release-Notes), [FastUMI](https://github.com/zxzm-zak/FastUMI_Data), [LeRobot v3](https://huggingface.co/docs/lerobot/lerobot-dataset-v3). See [design and research](docs/design.md).
+## Contents
 
-## Installation: Ubuntu 22.04 x86_64
+- [Hardware](#hardware)
+- [1. Setup](#1-setup)
+- [2. Calibration](#2-calibration)
+- [3. Data collection](#3-data-collection)
+- [4. Export to LeRobot](#4-export-to-lerobot)
+- [5. Training](#5-training)
+- [6. Robot rollout](#6-robot-rollout)
+- [7. Recording a rollout video](#7-recording-a-rollout-video)
+- [Results so far](#results-so-far)
+- [Troubleshooting](#troubleshooting)
+- [Repository layout](#repository-layout) · [Further docs](#further-docs)
 
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/) if unavailable, then:
+---
 
-```bash
-cd ~/yumi
-uv sync --locked --extra dev
-uv sync --locked --project exporter --python /usr/bin/python3.10
+## Hardware
+
+| Part | Model | Serial (SDK) | Role |
+|---|---|---|---|
+| Handheld wrist camera | RealSense D405 | `352122273221` | Training images, 640×480 @ 30 fps |
+| Handheld tracker | RealSense T265 | `943222111495` | 6-DoF pose of the handheld gripper |
+| Finger markers | ArUco `DICT_4X4_50`, IDs **13** (left) and **14** (right), 10 mm | — | Jaw width from marker separation |
+| Robot | Right arm of the bimanual YAM rig, E_Yam gripper | CAN `can_right` | Policy execution |
+| Robot wrist camera | RealSense D405 | `352122271723` (ASIC `254623070417`) | The policy's only input at deployment |
+| Top camera | RealSense D435 | `243622071623` (ASIC `348523020354`) | Scene view for recordings, not a policy input |
+| Left wrist camera | RealSense D405 | `409122274921` | Unused by these policies |
+
+The handheld body is printable from `tinyumi_D405_T265_NO_QUEST_assembly.stl`
+(sources in `tinyumi_D405_T265_NO_QUEST_final.zip`). Print the marker and board
+targets with the [Print & Calibration Guide](CALIBRATION_PRINT_GUIDE.md).
+
+<p align="center">
+  <img src="assets/top-camera.jpg" alt="Top D435 view of the two YAM arms, the green block and the wooden board" width="640"><br>
+  <sub>The deployment scene from the top D435: green block, wooden board, and the bimanual YAM rig (the policy uses the right arm).</sub>
+</p>
+
+> Karma takes the **ASIC** serial (`--camera-serial`); the yumi scripts take the
+> **SDK** serial (`--serial`). Mixing them up is the most common camera error.
+
+---
+
+## 1. Setup
+
+Two checkouts side by side, each with its own uv environment:
+
+```
+~/yumi    this repo: capture, calibration, export, training scripts, inference
+~/karma   robot stack: YAM drivers, CAN, IK, safety, LeRobot 0.6.1, viser
 ```
 
-The capture wheel already contains the userspace RealSense implementation. ROS, Conda, CUDA, and a system-wide replacement of librealsense are unnecessary. The kernel must expose UVC video devices and your account needs camera/USB access.
+| Environment | Python | Used for |
+|---|---|---|
+| `~/yumi` (`uv sync`) | 3.10, `pyrealsense2==2.53.1` | Anything that touches the **T265**: handheld capture and jaw-width calibration. Newer SDKs dropped T265 support. |
+| `~/karma` (`uv sync`) | 3.12/3.13, LeRobot 0.6.1 | Everything that touches the **robot** or **LeRobot**: export, offline evaluation, inference, gripper calibration, recording. Run as `cd ~/karma && uv run python ../yumi/scripts/<script>.py`. |
 
-Install the **pinned SDK's udev rules** once. The repository checkout already exists in `research/librealsense` on this machine. For a fresh installation:
+### yumi
+
+```bash
+git clone <this repo> ~/yumi && cd ~/yumi
+uv sync --locked --extra dev
+```
+
+Install the RealSense 2.53.1 udev rules once and replug the cameras (the T265
+enumerates twice, as `03e7:2150` and then `8087:0b37`):
 
 ```bash
 mkdir -p research
-curl -fL https://raw.githubusercontent.com/realsenseai/librealsense/v2.53.1/config/99-realsense-libusb.rules -o research/99-realsense-libusb.rules
-sudo install -m 644 research/99-realsense-libusb.rules /etc/udev/rules.d/99-realsense-libusb.rules
-sudo udevadm control --reload-rules
-sudo udevadm trigger --subsystem-match=usb
+curl -fL https://raw.githubusercontent.com/realsenseai/librealsense/v2.53.1/config/99-realsense-libusb.rules \
+  -o research/99-realsense-libusb.rules
+sudo install -m 644 research/99-realsense-libusb.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=usb
+uv run yumi devices          # lists every RealSense with its serial
 ```
 
-Unplug/replug both cameras. The T265 initially appears as `03e7:2150` and boots into `8087:0b37`; **both** need permissions. Both boot and runtime access are now working in the latest hardware test. If needed, add your login to `video`/`plugdev` and log out/in. `uv` cannot grant OS USB access.
+Pinned versions and why are in the [capture reference](docs/capture-reference.md#compatibility).
+
+### Karma
+
+[Karma](https://github.com/SRA-VJTI/karma) is the robot control stack for the
+YAM arms. yumi doesn't vendor it; the robot-side scripts import it from Karma's
+environment. What yumi uses from it, and how to set it up, is in
+**[docs/karma.md](docs/karma.md)**. In short:
 
 ```bash
-uv run yumi devices
-uv run yumi snapshot --serial 352122273221 --output artifacts/handheld.png
-uv run yumi detect --image artifacts/handheld.png --output artifacts/handheld-markers.png
+git clone https://github.com/SRA-VJTI/karma ~/karma && cd ~/karma
+sudo ./scripts/install_build_deps_ubuntu.sh
+./scripts/build_deps.sh
+UV_HTTP_TIMEOUT=180 uv sync --locked
+git clone https://github.com/i2rt-robotics/i2rt.git     # YAM MJCF for IK, git-ignored
+uv run karma-viz --fetch-meshes --model Yam
+
+# CAN buses (pinned names: see karma docs/yam-setup.md)
+sudo ip link set can_right up type can bitrate 1000000
+sudo ip link set can_left  up type can bitrate 1000000
+uv run karma doctor --rig yam_bimanual --interface-override right=can_right --probe
 ```
 
-The detected handheld D405 serial is `352122273221`, marker IDs **13, 14**, dictionary **DICT_4X4_50**. Two other D405s are attached. The newly connected overhead D435 is `243622071623`; T265 is `943222111495`. Always use explicit serials.
+The ACT + CLIP checkpoint also needs `transformers`. Add it per command with
+`uv run --with transformers --with huggingface_hub==1.28.0 ...`, as in the
+commands below; Karma's lockfile stays untouched.
 
-If a legacy wheel cannot access your kernel's video backend, a source build with `FORCE_RSUSB_BACKEND=ON` is an option; see [driver fallback](docs/driver-build.md). It still needs udev permissions. Do not mix SDK shared libraries from different versions.
+---
 
-## Calibrate, capture, convert
+## 2. Calibration
 
-`configs/umi.local.json` is ignored by Git and **does not exist in a fresh checkout**. Create it before running any command with `--config`. The following uses the previously tested handheld serials and 10 mm finger markers; confirm serials with `devices` and replace them if your hardware differs. Measure each marker's outer black square and update `markers.size_m` in metres if needed.
+Three things are calibrated: **jaw width** on the handheld gripper, the **YAM
+gripper's gap** against its command, and which **camera** is which. The tracker-to-gripper
+transform is currently an assumed rotation, not a measurement (see
+[known gaps](#known-gaps)).
 
-```bash
-cd ~/yumi
-uv run --locked yumi devices
-uv run --locked python - <<'PYCONFIG'
-import json
-from pathlib import Path
+### 2.1 Handheld jaw width (finger markers)
 
-path = Path("configs/umi.local.json")
-if path.exists():
-    print(f"Keeping existing {path}; check its serials and marker settings.")
-else:
-    config = json.loads(Path("configs/umi.example.json").read_text())
-    config["rgb_serial"] = "352122273221"
-    config["tracking_serial"] = "943222111495"
-    config["markers"]["size_m"] = 0.010
-    config["markers"]["width_method"] = "image_calibrated"
-    with path.open("x") as f:
-        json.dump(config, f, indent=2)
-        f.write("\n")
-    print(f"Created {path}; physical calibration is still required.")
-PYCONFIG
-```
+The jaw width comes from the pixel distance between ArUco markers 13 and 14 on the
+fingers. A ruler calibration maps that distance to millimetres.
 
-This creates an **unverified starting config**, with no fitted jaw model or tool transform. Keep an existing calibrated config instead of overwriting it. The historical local settings mentioned in the [Print & Calibration Guide](CALIBRATION_PRINT_GUIDE.md) and troubleshooting notes are not bundled with a fresh checkout.
+<p align="center"><img src="assets/marker-width.jpg" alt="Training frame with ArUco markers 13 and 14 detected on the fingers" width="480"></p>
 
-**Calibrate jaw opening.** Only one process can use the D405 at a time. Stop any recording or preview first. The live server requires `markers.width_method` to be `image_calibrated` (set above):
-
-```bash
-uv run --locked yumi calibrate-width-live --config configs/umi.local.json \
-  --samples data/calibration/width-live.json
-```
-
-Open **http://127.0.0.1:8080**. In a second terminal on the capture computer:
+Check that both markers decode across the whole opening range:
 
 ```bash
 cd ~/yumi
-uv run --locked yumi width-console
+uv run yumi preview-markers --config configs/umi.yam-collection.json   # http://localhost:8080
 ```
 
-Hold a physically measured inner jaw gap steady, wait for **READY**, then type its actual value in millimetres and press Enter. Collect at least six distinct measured openings spanning at least 20 mm and covering the usable travel. Set `markers.width_range_m` to your physical travel limits. Keep separate measured openings for validation. Use a new samples filename when recalibrating after a mounting or resolution change.
-
-Type `q` to exit the console, then **Ctrl+C in the server terminal** to release the camera. Fit the samples and save the result:
+Then run the four-point ruler calibration: jaws touching, two gaps in between, and
+fully open. It writes a new config with a piecewise-linear fit:
 
 ```bash
-uv run --locked yumi fit-width --samples data/calibration/width-live.json \
-  > data/calibration/width-fit.json
+uv run python scripts/calibrate_width_four_points.py --config configs/umi.yam-collection.json
 ```
 
-Proceed only if the fit succeeds. It rejects maximum training error above 1 mm by default. Review the result, then install its jaw model in the local config:
+The current fit (`data/calibration/width-20261007-recalibration.json`) covers
+**0–53 mm**. Widths outside the measured range are rejected rather than
+extrapolated. The full live calibration flow (`calibrate-width-live`,
+`width-console`, `fit-width`) and the tracker/board calibration are in the
+[capture reference](docs/capture-reference.md#calibrate-capture-convert) and
+[calibration notes](docs/calibration.md).
+
+### 2.2 YAM gripper gap
+
+The policy predicts a physical jaw width in metres. To command the YAM gripper
+to that same gap, measure the YAM fingertip gap with calipers at each gripper command:
 
 ```bash
-uv run --locked python - <<'PYCONFIG'
-import json
-from pathlib import Path
-
-path = Path("configs/umi.local.json")
-config = json.loads(path.read_text())
-fit = json.loads(Path("data/calibration/width-fit.json").read_text())
-config["markers"]["width_method"] = fit["width_method"]
-config["markers"]["image_width_calibration"] = fit["image_width_calibration"]
-config["calibration_verified"] = False
-path.write_text(json.dumps(config, indent=2) + "\n")
-PYCONFIG
+cd ~/karma
+uv run python ../yumi/scripts/measure_yam_gripper.py
 ```
 
-Validate displayed opening at held-out measured gaps using `uv run --locked yumi preview-markers --config configs/umi.local.json`; stop it before the next capture. See [marker troubleshooting](docs/marker-troubleshooting.md) for visibility and fit failures.
+- The arm is energized and held still; only the gripper moves.
+- At each command (1.0, 0.875, …, 0), measure the gap between the **inner faces
+  of the fingertips** and type it in mm. Press Enter to skip a step where the jaws
+  already touch; the gaps must strictly increase.
+- Then a touch test: hold the block between the fingers, press Enter as it closes,
+  and type `t` when the fingers touch it.
 
-**Calibrate camera/tracker geometry and timing.** Print [the stationary ID 0 target](calibration/aruco_0_100mm.svg) at actual size, measure its black square, and fix it to a rigid stationary board. During the recording below, move the handheld with varied rotations about at least two axes and some translation, keeping the board visible. Let the T265 establish confidence 3 first. Replace `0.100` with the measured board side in metres:
+It writes `configs/yam.gripper-width.json`, which inference reads with
+`--gripper-calibration`. Commands are interpolated from the table; widths beyond
+the measured ends are clamped to them.
 
-```bash
-uv run --locked yumi record --config configs/umi.local.json \
-  --output data/calibration/board --seconds 60
-uv run --locked yumi inspect --raw data/calibration/board \
-  --config configs/umi.local.json --output data/calibration/board-audit.json
-uv run --locked yumi calibrate-board --raw data/calibration/board \
-  --marker-id 0 --size-m 0.100 --output data/calibration/board-result.json
-```
+<p align="center"><img src="assets/gripper-calibration.png" alt="YAM fingertip gap rises from 5 mm at command 0 to 97 mm at command 1; the block is touched at command 0.32, about 32 mm" width="640"></p>
 
-Use new output paths for repeat recordings/results. Resolve frame-loss or timing-gate failures before accepting calibration. The solver saves `T_tracker_camera` and `camera_time_offset_s`; it does **not** update the local config. Copy the validated `camera_time_offset_s` into the config. Obtain `T_camera_tcp` from measured tool geometry/CAD and set the config's `T_tracker_tcp` to `T_tracker_camera @ T_camera_tcp` (4×4 matrix, translation in metres). The board cannot infer your tool contact point. Follow [tool geometry and validation](docs/calibration.md#4-define-the-tool-center-and-axes), including independent board captures and fixed-tip checks. Set `calibration_verified` and `timing_verified` true only after the physical spatial and timing checks pass. There is no single command that supplies all physical measurements automatically.
+### 2.3 Identify the wrist cameras
 
-A camera-only diagnostic works before calibration (cannot become a tracked demonstration):
+Cover one gripper's camera and watch which serial goes dark. The script is in
+[act-relative-policy.md §5](docs/act-relative-policy.md#rig). The right wrist is
+`352122271723`.
 
-```bash
-uv run yumi record --config configs/umi.local.json --output data/camera-check --seconds 15 --camera-only
-```
+---
 
-A tracked demonstration, after completing and validating calibration:
+## 3. Data collection
 
-```bash
-uv run yumi record --config configs/umi.local.json --output data/raw/episode-000 --seconds 30
-```
-
-Open **http://127.0.0.1:8080** during capture. Viser binds to `0.0.0.0`; on another laptop on this LAN, open `http://192.168.0.187:8080` (or the host’s current LAN address). Viser shows RGB, marker diagnostics when scale is supplied, and latest tracker/tool pose. The preview is not the synchronized export. Capture ends at the requested duration or Ctrl+C; each command creates a new episode directory. This single-episode command restarts devices; two seconds of processing warmup does not guarantee tracker confidence. Use persistent sessions below for repeated collection. Use `--no-viewer` for capture without a browser server.
+Demonstrations are recorded in a **persistent session**: the D405, T265 (and
+optionally the top D435) stay open, and each episode is started and stopped from
+the terminal.
 
 ```bash
-uv run yumi prepare --raw data/raw/episode-000 --calibration configs/umi.local.json --output data/prepared/episode-000.json
-uv run --project exporter python exporter/export_dataset.py export \
-  --root data/lerobot/my-task --repo-id local/my-task \
-  --manifests data/prepared/episode-000.json
-uv run --project exporter python exporter/export_dataset.py verify \
-  --root data/lerobot/my-task --repo-id local/my-task
-```
-
-Pass multiple prepared JSON files to `--manifests` for multiple episodes. No automatic Hub upload occurs. Existing output paths are never overwritten. A failed conversion leaves `.partial` for inspection; choose a new destination when retrying.
-
-A prepare failure identifies an episode requiring correction/recollection. Missing markers, tracking loss, repeated images, pose jumps, excessive width speed, clock resets, and timestamp gaps are not silently filled. Keep raw recordings; all calibration/processing is repeatable.
-
-## Persistent episode sessions (LeRobot v3)
-
-Use `record-session` to open the D405, T265 and Viser **once**, warm up tracking,
-then start each episode from the terminal. Install the isolated official v3
-writer once (its NumPy version differs from the camera SDK environment):
-
-```bash
-uv sync --project exporter --locked
-uv run --locked yumi record-session \
-  --config configs/umi.local.json \
+cd ~/yumi
+uv run yumi record-session \
+  --config configs/umi.yam-collection.json \
   --output "data/lerobot/session-$(date +%Y%m%d-%H%M%S)" \
-  --episodes 3 --seconds 30 --warmup 30 \
-  --task "Pick up the block and place it in the container"
+  --episodes 25 --warmup 30 --require-valid-width \
+  --task "Pick up the green block and place it on the wooden board"
 ```
 
-Use your intended calibrated or explicitly provisional config. A session never
-sets calibration/timing verification flags to true. Open **http://localhost:8080**
-and keep it open. During the initial 30 seconds, move gently so tracking can
-initialize. Thirty seconds is a minimum warmup, not a promise of confidence.
-At each prompt, press **Enter** to start; starting requires fresh RGB and fresh
-tracking confidence 3/3 and valid jaw width sustained for one second. If not ready, wait and press
-Enter again. Devices and the browser remain live during warmup, saving and resets;
-only active episode samples are saved. Each episode ends at `--seconds`.
+1. Open **http://localhost:8080** (or the machine's LAN address). Move the
+   gripper gently during the 30 s warm-up until tracking reaches confidence 3/3.
+2. Reset the scene, hold the gripper in the start pose, and press **Space** to
+   start. Recording starts only after one second of fresh pose and a valid jaw width.
+3. Do the task, then press **Space** to stop. Repeat. **q** finishes the session.
 
-- **Ctrl+C while recording:** finish and save the shortened episode, then prompt
-  for the next one. It counts toward `--episodes` if it contains RGB frames.
-- **q + Enter, or Ctrl+C at the ready prompt:** finalize the dataset and exit.
-- Tracking loss during an episode is recorded in quality fields, not silently
-  removed or presented as valid. Writer/sensor failures mark the session failed.
-- A conservative free-space check runs before each episode. Use a new output
-  directory for every session; existing datasets are never overwritten.
+<p align="center"><img src="assets/training-demo-strip.jpg" alt="Five frames of a training demonstration: approach, grasp, lift, carry, place" width="960"></p>
 
-The result is an **official LeRobot v3 raw-observation dataset**: `meta/`, parquet
-`data/`, and RGB MP4 `videos/`. `extras/episode_*/` retains full-rate pose/IMU and
-sensor timestamps plus losslessly compressed native Z16 depth (`.npz`, key
-`depth`). `session.json` documents capture configuration and semantics. Detailed
-encoder logs go to the adjacent `*.writer.log`, keeping the terminal readable.
+Tips that mattered for this task:
 
-This capture schema deliberately has **no `action` feature**. Its
-`observation.state` is a provisional TCP pose in the persistent T265 session frame
-and aperture in metres, paired with the last received pose, not a claimed
-synchronized training label. `observation.quality` contains tracking confidence,
-pose-valid and width-valid flags, and image-minus-pose time. Missing width uses
-zero with `width_valid=0`; missing pose uses identity with `pose_valid=0`.
-`observation.sensor_time` preserves real device/host times independently of
-LeRobot's nominal FPS timestamps. Do not train on invalid placeholders.
+- Start every demo from roughly the same pose and keep both finger markers in
+  view. Episodes with long marker dropouts or tracking jumps are filtered out at
+  export.
+- Start with the gripper pitched down toward the table, as the robot's wrist
+  camera will be. The policy only knows the views it was trained on.
+- Vary the block position. With one fixed spot, the policy memorizes trajectories
+  instead of finding the block.
 
-Use the [single-arm UMI workflow](docs/single-arm-umi.md) for synchronized relative
-action chunks, official LeRobot v3 export and offline YAM IK feasibility. Physical
-calibration/timing verification and a matching policy/runtime remain necessary.
-The legacy `yumi prepare` and `export_dataset.py verify` commands below target the
-older raw/8D next-action pipeline, **not this session observation schema**. Use the
-official LeRobot loader to inspect session datasets. `yumi prepare-session` now
-constructs gated training chunks separately from capture; `yumi plan-robot` checks
-one chunk offline against the pinned Karma/YAM model. `COMPLETE` means
-capture finalized, not calibration or policy-readiness verification.
+Each session is a LeRobot v3 dataset of raw observations: wrist video, full-rate
+pose and IMU logs, and lossless depth under `extras/`. Training actions are built
+at export. Session format details are in the
+[capture reference](docs/capture-reference.md#persistent-episode-sessions-lerobot-v3).
 
-## Legacy raw capture and action semantics
-
-- Raw `rgb/*.png`: original RGB, lossless. Raw `depth/*.npy`: native, unaligned `uint16` Z16. Multiply by `depth_scale_m` from metadata for metres. Depth and color intrinsics/extrinsics are recorded separately.
-- `samples.jsonl`: full-rate T265 poses/confidences/velocities and accel/gyro, independent RGB and depth device timestamps, frame numbers, host monotonic arrival timestamps, timestamp domains.
-- `metadata.json`: serial configuration, SDK/firmware, calibrated intrinsics, depth scale, extrinsics. `COMPLETE` means the writer closed; it does **not** mean the episode passed quality checks.
-- LeRobot `observation.images.d405`: RGB MP4; `observation.state`: `[x,y,z,qx,qy,qz,qw,aperture]` in metres with an xyzw unit quaternion.
-- `action`: the **next sampled absolute TCP pose and opening**, in the **first retained TCP pose's coordinate frame**. The final observation is omitted because it lacks a future target. This is a Cartesian demonstration convention, not measured robot joint commands.
-- `observation.capture_time` and `observation.quality` preserve real timing and measurement diagnostics alongside LeRobot's nominal FPS timestamps.
-- Dataset `extras/episode_*/`: lossless depth, full-rate pose/IMU log, metadata, and prepared manifest. Depth is deliberately **not** encoded into lossy RGB video. Extras are not loaded automatically as policy observation tensors.
-
-This legacy 8D schema differs from the new session processor's relative 10D
-action-chunk contract. Do not mix their labels or policy configurations. Neither
-format includes a trained policy or validated hardware controller. Bimanual
-collection and absolute external-world anchoring remain outside this single-arm
-path. The D435 is not needed for the single-handheld pipeline.
-
-## Software verification
+**Review and replay (optional, no hardware).** Replay a capture on a virtual YAM
+through Karma's IK, to check that the motion is reachable before training on it:
 
 ```bash
-uv run --extra dev pytest -q
-uv run --extra dev ruff check src tests scripts exporter/export_dataset.py
-uv run python scripts/synthetic_smoke.py --root artifacts/new-synthetic
-uv run --project exporter python exporter/export_dataset.py export \
-  --root artifacts/new-v3-test --repo-id local/synthetic-test \
-  --manifests artifacts/new-synthetic/episode_0/prepared.json artifacts/new-synthetic/episode_1/prepared.json
+cd ~/karma
+uv run python ../yumi/scripts/replay_yam.py ../yumi/data/raw/session-02/episode-010   # http://localhost:8080
 ```
 
-Synthetic recordings are visibly labeled and do not establish physical accuracy. The two uv lockfiles are part of the reproducible setup.
+`scripts/collect_umi_run.py` combines capture and replay review with
+accept/retry buttons ([docs/umi-reviewed-runs.md](docs/umi-reviewed-runs.md)).
+
+---
+
+## 4. Export to LeRobot
+
+`export_umi_lerobot.py` converts one or more sessions into a training dataset
+in UMI's relative representation. The green-block dataset was built from three
+sessions:
+
+```bash
+cd ~/karma
+uv run python ../yumi/scripts/export_umi_lerobot.py \
+  ../yumi/data/raw/session-02 \
+  ../yumi/data/lerobot/session-20261010-173857 \
+  ../yumi/data/lerobot/session-20261010-175220 \
+  --repo-id vruga/pick-place-the-green-block \
+  --root ../yumi/data/lerobot/yumi-umi-block-place-v2 \
+  --task "pick up the green block and place it on the wooden board" \
+  --skip episode-000 episode-001 episode-002 episode-003 \
+         session-20261010-173857/episode_000001 session-20261010-173857/episode_000003 \
+  --push            # private Hub upload; add --public to make it public
+```
+
+How each frame is built:
+
+- **Time base:** the wrist image. Pose and width are interpolated to its capture time.
+- **Tracker to TCP:** `T_tracker_tcp` is an assumed rotation with zero offset,
+  `[[0,-1,0],[-1,0,0],[0,0,-1]]`.
+- **Width:** marker separation through the ruler fit. Short dropouts are
+  interpolated; episodes with longer dropouts, pose jumps, or under 4 s are dropped.
+  The reason for each drop is recorded in `meta/umi_export.json`.
+
+| Feature | Shape | Meaning |
+|---|---|---|
+| `observation.images.wrist` | 480×640×3 | D405 RGB (AV1 video) |
+| `observation.state` | 11 | Pose 3 frames (0.1 s) ago relative to now (xyz + rot6d), previous width, current width |
+| `observation.ee_pose` | 10 | Current pose in the episode-start frame + width |
+| `action` | 10 | Next pose in the episode-start frame + width. Training turns windows into relative chunks. |
+
+The result is 45 episodes and 15,912 frames, about 8.8 minutes. rot6d is the
+first two columns of the rotation matrix.
+
+---
+
+## 5. Training
+
+Training ran on a remote GPU with the scripts in [`training/`](training/); copies
+also ship inside each checkpoint folder. They use LeRobot's ACT with two changes:
+
+- **Relative action chunks (UMI PD2.1):** each 50-step action window becomes
+  poses relative to the current pose, `inv(T_now) · T_k`. Normalization stats
+  are recomputed over those relative chunks. Width stays absolute.
+- **CLIP backbone (`act_clip`):** ResNet18 is replaced by a fine-tuned CLIP
+  ViT-B/16. Images are resized to 224×304 inside the model.
+
+```bash
+# ACT + CLIP on the 45-episode green-block dataset, episode 44 held out (the released model)
+python training/train_v2.py \
+  --root <local copy of vruga/pick-place-the-green-block> \
+  --repo-id vruga/pick-place-the-green-block \
+  --out outputs/v2_act_clip_relative \
+  --val-eps 44 --chunk 50 --steps 30000 --batch 32 --lr 1e-4
+
+# Earlier models on the first dataset (vruga/yumi-umi-block-place)
+python training/train_act_relative.py --root <data> --out outputs/act_relative --chunk 50 --steps 20000
+python training/train_relative.py --policy act_clip      # or --policy diffusion (2 observation frames)
+```
+
+`train_relative.py` loads CLIP through `transformers` from a `pydeps/` folder
+next to the script. Install it there, or into the training environment.
+
+| Setting | Value |
+|---|---|
+| Inputs | wrist image 480×640, `observation.state` (11) |
+| Output | 50 × 10 relative chunk (1.67 s at 30 fps) |
+| Transformer | d_model 512, 8 heads, 4 encoder / 1 decoder layers, VAE latent 32 |
+| Optimizer | AdamW, lr 1e-4 (backbone 1e-5), batch 32, bf16 |
+| Validation | Held-out episode 44 every 500 steps; the best checkpoint is kept |
+
+<p align="center"><img src="assets/training-curve.png" alt="Train L1 falls from 0.31 to 0.05 over 30k steps while held-out L1 stays near 0.30-0.33" width="640"></p>
+
+Held-out loss is flat from about step 2,000 while training loss keeps falling, so
+the model memorizes the 44 training episodes. The released checkpoint is
+step 6,000, the best held-out loss. More varied demonstrations matter more than
+longer training.
+
+| Model | Hub | Local |
+|---|---|---|
+| ACT + CLIP, 45 episodes (current) | `vruga/pick-place-the-green-block-act-clip-relative` | `data/policies/pick-place-the-green-block-act-clip-relative` |
+| ACT, 22 episodes | `vruga/yumi-umi-block-place-act-relative` | `data/policies/yumi-umi-block-place-act-relative` |
+
+```bash
+# Download a checkpoint (skip the intermediate checkpoints)
+cd ~/karma && uv run python -c "from huggingface_hub import snapshot_download as d; \
+d('vruga/pick-place-the-green-block-act-clip-relative', local_dir='../yumi/data/policies/pick-place-the-green-block-act-clip-relative', ignore_patterns=['checkpoints/*'])"
+```
+
+**Offline check on the held-out episode** (no hardware):
+
+```bash
+cd ~/karma
+uv run --with transformers --with huggingface_hub==1.28.0 python ../yumi/scripts/infer_act_relative.py offline \
+  --checkpoint ../yumi/data/policies/pick-place-the-green-block-act-clip-relative \
+  --dataset ../yumi/data/lerobot/yumi-umi-block-place-v2 \
+  --episodes 44 --stride 5 --output ../yumi/artifacts/eval-heldout-ep44.json
+```
+
+---
+
+## 6. Robot rollout
+
+`scripts/infer_act_relative.py live` runs the policy on the right YAM arm:
+
+1. Read a wrist frame.
+2. Build `observation.state` from forward kinematics of the measured joints,
+   interpolated to the frame's capture time.
+3. Infer a 50-step relative chunk and compose it with the current pose.
+4. Solve IK and stream joint targets through Karma's safety layer.
+
+All robot commands run from `~/karma`. **Keep a hand on the e-stop.**
+
+**Step 1: dry run in sim.** Same camera and policy, virtual arm, nothing energized.
+Open http://localhost:8090 to see the predicted chunks.
+
+```bash
+cd ~/karma
+uv run --with transformers --with huggingface_hub==1.28.0 python ../yumi/scripts/infer_act_relative.py live \
+  --robot sim --viser --speed 0.5 --max-seconds 30 --elbow-min 0.3 \
+  --gripper-calibration ../yumi/configs/yam.gripper-width.json --start-width 0.045 \
+  --sync --steps-per-inference 50 --max-chunk-reach 0.35 \
+  --checkpoint ../yumi/data/policies/pick-place-the-green-block-act-clip-relative \
+  --log ../yumi/artifacts/sim-$(date +%H%M%S).json
+```
+
+**Step 2: live on the arm.**
+
+```bash
+cd ~/karma
+uv run --with transformers --with huggingface_hub==1.28.0 python ../yumi/scripts/infer_act_relative.py live \
+  --robot yam --viser --speed 0.5 --max-seconds 40 --elbow-min 0.3 --exec-latency 0.11 \
+  --gripper-calibration ../yumi/configs/yam.gripper-width.json --start-width 0.045 \
+  --sync --steps-per-inference 50 --max-chunk-reach 0.35 \
+  --checkpoint ../yumi/data/policies/pick-place-the-green-block-act-clip-relative \
+  --log ../yumi/artifacts/live-$(date +%H%M%S).json
+```
+
+At startup it should print `Gripper uses measured physical aperture mapping`.
+Ctrl+C stops commanding, parks the arm at `home_pos`, and powers it down.
+Settings such as the arm, CAN interface, wrist serial, table height, and start
+pose are inherited from `configs/yam.replay.json` and printed at startup.
+
+**Remote diffusion server.** `--checkpoint` also takes a diffusion server URL,
+such as `--checkpoint http://<gpu-host>:8205`. Only inference runs remotely; the arm, IK,
+camera and safety stay local.
+
+| Flag | Why |
+|---|---|
+| `--sync --steps-per-inference 50` | Executes the whole chunk before observing again. In the default pipelined mode only 3–4 steps of each chunk run, so a grasp predicted at the end of a chunk never happens. |
+| `--gripper-calibration FILE` | Commands the physical width the policy predicts ([§2.2](#22-yam-gripper-gap)). Without it, `--umi-width-range 0 0.053` maps 0–53 mm onto the full YAM travel, and `--yam-open-max 0.75` caps the opening. |
+| `--elbow-min 0.3` | When a low target would straighten the elbow, tilts the tool further down (up to 35°) so the arm stays bent, the way a hand does near the table |
+| `--max-chunk-reach 0.35` | Rejects a chunk that moves the tool further than this (m) |
+| `--exec-latency 0.11` | Command-to-motion delay; each run prints its measured value at the end |
+| `--speed 0.5` | Plays chunks at half the training rate |
+| `--start-width 0.045` | Jaw width before the policy starts; training episodes start at 35–52 mm |
+| `--cube X Y` | Moves the start pose's grasp point to the block's position (m, arm base frame) |
+| `--shadow` | Runs perception and planning but sends no arm commands |
+
+Control-loop details, timing, model inputs and the earlier run history are in
+[docs/act-relative-policy.md](docs/act-relative-policy.md).
+
+---
+
+## 7. Recording a rollout video
+
+Add `--record DIR` to the live command. It records the wrist D405 and the top
+D435 (1280×720) to `DIR/wrist.mp4` and `DIR/top.mp4`, with per-frame timestamps,
+until the arm starts parking:
+
+```bash
+cd ~/karma
+uv run --with transformers --with huggingface_hub==1.28.0 python ../yumi/scripts/infer_act_relative.py live \
+  --robot yam --speed 0.5 --max-seconds 40 --elbow-min 0.3 --exec-latency 0.11 \
+  --gripper-calibration ../yumi/configs/yam.gripper-width.json --start-width 0.045 \
+  --sync --steps-per-inference 50 --max-chunk-reach 0.35 \
+  --checkpoint ../yumi/data/policies/pick-place-the-green-block-act-clip-relative \
+  --log ../yumi/artifacts/blog-01.json --record ../yumi/artifacts/blog-01
+```
+
+Then merge it with a training demonstration:
+
+```bash
+uv run python ../yumi/scripts/make_rollout_video.py ../yumi/artifacts/blog-01 \
+  --log ../yumi/artifacts/blog-01.json --episode 44
+```
+
+| Output | Contents |
+|---|---|
+| `blog.mp4` | 1920×1080: training demo and robot wrist on the left, top camera on the right, clock and gripper width |
+| `rollout.mp4` | Top camera next to the wrist camera |
+| `demo.mp4` | The training episode alone |
+
+The rollout is cut from 1 s before the policy's first observation to 1.5 s after
+its last command. `--speedup 2` plays the robot side faster, and
+`--top-serial none` records the wrist camera only. The videos at the top of this page are this
+run's outputs: [`blog.mp4`](assets/blog.mp4), [`rollout.mp4`](assets/rollout-top-wrist.mp4) and
+[`demo.mp4`](assets/training-demo.mp4).
+
+<p align="center"><img src="assets/rollout-frame.jpg" alt="Merged frame: training demo, robot wrist view, and top view with the arm over the wooden board" width="900"></p>
+
+---
+
+## Results so far
+
+**Held-out episode 44** (offline, 107 frames, error against the recorded chunk):
+
+| Model | Mean position error | Error at chunk end (1.67 s) | Rotation | Width |
+|---|---|---|---|---|
+| ACT + CLIP, 45 episodes (current) | **36.7 mm** | **73.6 mm** | **6.3°** | **1.5 mm** |
+| ACT + CLIP, 22 episodes, filtered | 73.1 mm | 138.2 mm | 12.8° | 3.6 mm |
+| ACT + CLIP, 22 episodes | 57.7 mm | 106.7 mm | 10.7° | 3.0 mm |
+
+**On the robot:** with full-chunk execution, the calibrated gripper and
+`--elbow-min`, the arm reaches the block, closes to about 33 mm, and carries it
+over the board (video above). No success rate has been measured yet.
+
+What we've learned:
+
+- **It memorizes.** Moving or mirroring the block changes the predicted
+  trajectory less than it should. Validation loss stops improving early. Block
+  placement near the training positions matters; `--cube X Y` helps.
+- **The views differ.** On the YAM, the fingers sit at the image edges and have
+  no markers; on the handheld they sit bottom-centre. Starting pitched down, as
+  in the demos, keeps the block and board in view.
+
+<p align="center"><img src="assets/umi-vs-yam-view.jpg" alt="Training view from the handheld D405 next to the YAM wrist D405 view at the start of a rollout" width="900"></p>
+
+### Known gaps
+
+- `T_tracker_tcp` is assumed, not measured, and the camera-to-pose time offset
+  is 0 (uncalibrated).
+- In the sparsest episodes, many jaw-width labels are interpolated across marker dropouts.
+- One held-out episode is a noisy measure of generalization.
+- One task, one block, one board; 45 demonstrations.
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `Frame didn't arrive within 5000` | The D405 is stuck. Reset it: `uv run python -c "import pyrealsense2 as rs; [d.hardware_reset() for d in rs.context().devices if d.get_info(rs.camera_info.serial_number)=='352122271723']"` |
+| `Device or resource busy` | Another process has the camera. `for v in /dev/video*; do fuser $v; done` |
+| Gripper never closes | Run with `--sync --steps-per-inference 50`; the close comes at the end of a chunk |
+| Arm reaches with a straight elbow, low | Add `--elbow-min 0.3` |
+| `chunk rejected: reaches … mm` | The view or start pose is unfamiliar. Reset the scene to look like a training start; check the Viser camera view |
+| `--gripper-calibration` rejected | The table must match `--arm`/`--interface` and have at least 3 strictly increasing points; re-run `measure_yam_gripper.py` |
+| Power-up fails on the CAN bus | `ip -br link show type can`; bring `can_right` up at 1 Mbit/s |
+| `No module named transformers` | Add `--with transformers --with huggingface_hub==1.28.0` to `uv run` |
+
+---
+
+## Repository layout
+
+```
+assets/         README media: rollout videos (blog.mp4, rollout-top-wrist.mp4, training-demo.mp4), blog.gif, stills, charts
+calibration/    printable ArUco board and marker sheets
+configs/        capture configs (umi.*), robot/replay settings (yam.*), YAM gripper table
+docs/           detailed docs (below)
+exporter/       isolated LeRobot writer env, legacy exporters and diffusion baseline
+scripts/        export, inference, replay, calibration, recording tools
+  export_umi_lerobot.py   sessions -> UMI relative LeRobot v3 dataset
+  infer_act_relative.py   offline eval and live/sim rollout on the YAM
+  yam_motion.py           smooth pose IK, lift arcs, joint streaming
+  gripper_mapping.py      measured YAM gripper table
+  measure_yam_gripper.py  YAM gripper calibration
+  make_rollout_video.py   demo + wrist + top camera video
+  replay_yam.py           replay a capture on a virtual YAM
+src/yumi/       capture CLI (`uv run yumi ...`): devices, record-session, markers, calibration
+training/       ACT / ACT + CLIP / diffusion training scripts (run on the GPU host)
+tests/          pytest suite
+data/, artifacts/   recordings, datasets, checkpoints, logs (git-ignored)
+```
+
+## Further docs
+
+| Doc | Contents |
+|---|---|
+| [docs/karma.md](docs/karma.md) | How yumi uses Karma, and how to set Karma up for it |
+| [docs/act-relative-policy.md](docs/act-relative-policy.md) | Policy inputs and outputs, control loop, timing, run history |
+| [docs/capture-reference.md](docs/capture-reference.md) | SDK pins, installation, full calibration, capture formats |
+| [docs/calibration.md](docs/calibration.md) | Tool center, tracker and timing calibration |
+| [docs/single-arm-umi.md](docs/single-arm-umi.md) | Chunked export, diffusion baseline, offline IK feasibility |
+| [docs/umi-reviewed-runs.md](docs/umi-reviewed-runs.md) · [docs/collect-10.md](docs/collect-10.md) | Capture with replay review and acceptance gates |
+| [docs/marker-troubleshooting.md](docs/marker-troubleshooting.md) | Marker visibility and width-fit failures |
+| [CALIBRATION_PRINT_GUIDE.md](CALIBRATION_PRINT_GUIDE.md) | What to print and how to mount it |
+
+```bash
+uv run --extra dev pytest -q        # software checks (no hardware)
+```
