@@ -6,11 +6,15 @@ Run with karma's environment, which provides mujoco, viser and vr_teleop_kit:
     cd ~/karma && uv run python ../yumi/scripts/replay_yam.py ../yumi/data/<capture>
 
 Targets go through EEFollower + DecoupledIKSolver, the same path a policy's
-end-effector actions take on the robot. Nothing here talks to hardware.
+end-effector actions take on the robot, or with --ik mink through the full-pose
+MinkIKSolver (scripts/mink_ik.py). Nothing here talks to hardware.
 
 With a world camera in the capture and configs/world_camera.json (from
 calibrate_world.py), the arm, hand path and inner workspace are drawn over the
 recorded overhead video. Align the base, then the UMI anchor, and save them.
+
+With --workspace-model (scripts/workspace_model.py), the learned workspace marks
+hand targets it predicts the arm cannot reach and can fit the demo placement.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -44,6 +48,14 @@ YAM_FINGER_MAX = .0475  # joint7/joint8 travel; full opening is twice this
 # Deployment velocity caps, matching karma's YAM teleop defaults (rad per IK tick).
 MAX_DQ = [.06]*3+[.24]*3
 POS_OK_MM, ROT_OK_DEG = 10., 5.
+IK_SOLVERS = ('decoupled', 'mink')
+
+
+def make_solver(ik='decoupled', **kwargs):
+    if ik == 'mink':
+        from mink_ik import MinkIKSolver
+        return MinkIKSolver(**kwargs)
+    return DecoupledIKSolver(**kwargs)
 
 
 def wxyz(matrix):
@@ -193,10 +205,10 @@ def pose_error(target, actual):
                 target[:3, :3] @ actual[:3, :3].T).as_rotvec()))))
 
 
-def solve(capture, tracker_tcp, mode, rate, ik_hz, mu, anchor=None, inner=None, initial_joints=None):
+def solve(capture, tracker_tcp, mode, rate, ik_hz, mu, anchor=None, inner=None, initial_joints=None, ik='decoupled'):
     """Drive the deployment follower through every target; return per-sample results and a report."""
     meta, images, times, grid, world_tracker, valid, image_times, widths = capture
-    solver = DecoupledIKSolver(mu=mu, max_dq_per_joint=MAX_DQ)
+    solver = make_solver(ik, mu=mu, max_dq_per_joint=MAX_DQ)
     initial_joints = np.asarray(READY if initial_joints is None else initial_joints, float)
     if (initial_joints.shape != (6,) or not np.isfinite(initial_joints).all()
             or np.any(initial_joints < solver.joint_limits[:, 0])
@@ -469,23 +481,51 @@ def serve(args, capture, state, tracker_rotation, world_calib, space):
             for control in [*tweaks, *offsets]:
                 control.disabled = True
         summary = server.gui.add_markdown(summary_markdown(state['report']))
+    reach_model = state.get('workspace_model')
+    if reach_model is not None:
+        unreachable = server.scene.add_point_cloud('/mlp_unreachable', points=np.zeros((1, 3), np.float32),
+                                                   colors=(200, 40, 160), point_size=.008, visible=False)
+        with server.gui.add_folder('Learned workspace (MLP)', order=5.5):
+            server.gui.add_markdown('One network pass per pose, trained on converged multi-start IK. '
+                                    'Magenta: hand targets it predicts no IK can reach (10 mm / 5°).')
+            show_unreachable = server.gui.add_checkbox('Show predicted unreachable', True)
+            reach_summary = server.gui.add_markdown('')
+            fit = server.gui.add_button('Fit placement and re-solve')
+            fit_result = server.gui.add_markdown('')
+
+        def annotate():
+            samples = state['samples']
+            targets = np.array([s['target'] for s in samples])
+            p = reach_model.predict(targets)['p_reach']
+            for s, v in zip(samples, p):
+                s['p_reach'] = float(v)
+            valid = np.array([s['valid'] for s in samples])
+            bad = valid & (p < .5)
+            unreachable.points = (targets[bad, :3, 3] if bad.any() else np.zeros((1, 3))).astype(np.float32)
+            unreachable.visible = bool(bad.any()) and show_unreachable.value
+            tracked = np.array([s['status'] != 'miss' for s in samples])
+            reach_summary.content = (f'Predicted reachable: **{1-bad.sum()/max(1, valid.sum()):.1%}** of valid targets · '
+                                     f'IK tracked {tracked[valid].mean():.1%}')
+        annotate()
+        show_unreachable.on_update(lambda _: annotate())
     commands = queue.SimpleQueue()
     timeline.on_update(lambda event: commands.put(('seek', timeline.value)) if event.client is not None else None)
     restart.on_click(lambda _: commands.put(('seek', 0.)))
     redraw = threading.Event()
     redraw.set()
 
-    @resolve.on_click
-    def _(_):
+    def start_resolve():
         resolve.disabled = True
         summary.content = 'Solving…'
 
         def work():
             tracker_tcp = tracker_tcp_from(tracker_rotation, np.array([o.value for o in offsets])/100,
                                            [t.value for t in tweaks])
-            anchor = [a.value for a in anchor_sliders] if aligned and mode.value == 'world' else None
+            anchor = None
+            if mode.value == 'world':
+                anchor = [a.value for a in anchor_sliders] if aligned else state.get('fitted_anchor')
             samples, report = solve(capture, tracker_tcp, mode.value, args.rate, args.ik_hz, args.mu,
-                                    anchor, state.get('inner'), args.initial_joints)
+                                    anchor, state.get('inner'), args.initial_joints, args.ik)
             state.update(samples=samples, report=report)
             if aligned and report['anchor_xyz_m_yaw_deg']:
                 for slider, v in zip(anchor_sliders, report['anchor_xyz_m_yaw_deg']):
@@ -493,9 +533,37 @@ def serve(args, capture, state, tracker_rotation, world_calib, space):
             summary.content = summary_markdown(report)
             print(json.dumps({k: report[k] for k in ('mapping', 'T_tracker_tcp', 'tracked_fraction',
                   'position_error_mm', 'rotation_error_deg')}), flush=True)
+            if reach_model is not None:
+                annotate()
             resolve.disabled = False
             redraw.set()
         threading.Thread(target=work, daemon=True).start()
+
+    resolve.on_click(lambda _: start_resolve())
+
+    if reach_model is not None:
+        @fit.on_click
+        def _(_):
+            from workspace_model import fit_placement, shifted_anchor
+            report = state['report']
+            if report['anchor_xyz_m_yaw_deg'] is None:
+                fit_result.content = 'Placement applies to the gravity and world mappings, not relative.'
+                return
+            fit.disabled = True
+            fit_result.content = 'Fitting…'
+            targets = np.array([s['target'] for s in state['samples'] if s['valid']])
+            shift, before, after = fit_placement(reach_model, targets)
+            anchor = shifted_anchor(report['anchor_xyz_m_yaw_deg'], shift)
+            state['fitted_anchor'] = anchor
+            if aligned:
+                for slider, v in zip(anchor_sliders, anchor):
+                    slider.value = float(v)
+            mode.value = 'world'
+            fit_result.content = (f'Shift demo **{shift[0]*100:+.1f} / {shift[1]*100:+.1f} / {shift[2]*100:+.1f} cm**, '
+                                  f'**{shift[3]:+.1f}°** yaw · predicted reachable {before:.1%} → {after:.1%}. '
+                                  'Re-solving with full IK…')
+            fit.disabled = False
+            start_resolve()
 
     @server.on_client_connect
     def connected(client):
@@ -581,10 +649,11 @@ def serve(args, capture, state, tracker_rotation, world_calib, space):
                              if v is not None and v > .5] + (['joint limit'] if sample.get('limit_pressure', 0) > 1e-6 else [])
                     phase = ('APPROACH · ' if position < state['report'].get('approach_duration_s', 0) else
                              'RECORDED MOTION · ' if 'approach_duration_s' in state['report'] else '')
+                    reach = f' · MLP p(reach) {sample["p_reach"]:.2f}' if 'p_reach' in sample else ''
                     status.content = (f'**{phase}{position:.2f} / {duration:.2f} s** · '
                         f'error **{sample["position_error_mm"]:.1f} mm** / '
                         f'**{sample["rotation_error_deg"]:.1f}°**\n\n'
-                        f'Jaw {width}' + (f' · ⚠ {", ".join(flags)}' if flags else ''))
+                        f'Jaw {width}{reach}' + (f' · ⚠ {", ".join(flags)}' if flags else ''))
                 else:
                     status.content = (f'**{position:.2f} s · UNVERIFIED TRACKING** — diagnostic simulation only'
                                       if state['report'].get('diagnostic_tracking') else
@@ -638,6 +707,10 @@ def main():
     parser.add_argument('--rate', type=float, default=30., help='Target rate, like a policy action stream (Hz)')
     parser.add_argument('--ik-hz', type=float, default=200., help='EEFollower inner loop rate (Hz)')
     parser.add_argument('--mu', type=float, default=.005, help='Posture bias; EEFollower deploy maximum')
+    parser.add_argument('--ik', choices=IK_SOLVERS, default='decoupled',
+                        help='decoupled: karma DecoupledIKSolver; mink: full-pose QP step (scripts/mink_ik.py)')
+    parser.add_argument('--workspace-model', type=Path, default=ROOT/'artifacts/workspace-mlp/model.pt',
+                        help='Learned workspace from scripts/workspace_model.py (skipped when missing)')
     parser.add_argument('--min-confidence', type=int, choices=(1, 2, 3),
                         help='Override the config tracker-confidence gate (preview only below 3)')
     parser.add_argument('--no-width', action='store_true', help='Skip marker width detection')
@@ -674,16 +747,20 @@ def main():
             args.mount_tweak, args.tcp_offset = saved['mount_tweak_deg'], saved['tcp_offset_m']
             tcp_source += f' · mount tweak {args.mount_tweak}° from {session.name}'
     tracker_tcp = tracker_tcp_from(tracker_rotation, np.asarray(args.tcp_offset), args.mount_tweak)
-    samples, report = solve(capture, tracker_tcp, args.mapping, args.rate, args.ik_hz, args.mu, anchor, inner, args.initial_joints)
-    report = {'capture': str(args.capture.resolve()), 'T_tracker_tcp_source': tcp_source,
+    samples, report = solve(capture, tracker_tcp, args.mapping, args.rate, args.ik_hz, args.mu, anchor, inner, args.initial_joints, args.ik)
+    report = {'capture': str(args.capture.resolve()), 'T_tracker_tcp_source': tcp_source, 'ik': args.ik,
               'min_tracker_confidence': min_confidence, **report}
     print(json.dumps(report, indent=2), flush=True)
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2)+'\n')
+    reach_model = None
+    if args.workspace_model and args.workspace_model.exists():
+        from workspace_model import WorkspaceModel
+        reach_model = WorkspaceModel(args.workspace_model)
     if not args.check:
         serve(args, capture, {'samples': samples, 'report': report, 'tcp_source': tcp_source,
-                              'inner': inner}, tracker_rotation, world_calib, space)
+                              'inner': inner, 'workspace_model': reach_model}, tracker_rotation, world_calib, space)
 
 
 if __name__ == '__main__':

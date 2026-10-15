@@ -244,6 +244,22 @@ uv run python ../yumi/scripts/replay_yam.py ../yumi/data/raw/session-02/episode-
 `scripts/collect_umi_run.py` combines capture and replay review with
 accept/retry buttons ([docs/umi-reviewed-runs.md](docs/umi-reviewed-runs.md)).
 
+**IK solver and learned workspace (sim only).** `--ik mink` swaps Karma's decoupled
+IK for a full-pose QP step (`scripts/mink_ik.py`); `filter_training_ik.py` takes
+the same flag. `scripts/workspace_model.py` trains an MLP on converged IK that
+predicts whether a tool pose is reachable (5 µs per pose, 99.8% agreement with
+full IK on real demo frames) and fits a demo placement that makes every frame
+reachable (`fit`, then `filter_training_ik.py --anchor-shift`). When
+`artifacts/workspace-mlp/model.pt` exists, the replay viewer marks
+predicted-unreachable targets and has a **Fit placement** button.
+
+```bash
+cd ~/karma
+uv run python ../yumi/scripts/workspace_model.py gen --out ../yumi/artifacts/workspace-mlp/labels.npz
+uv run python ../yumi/scripts/workspace_model.py train --labels ../yumi/artifacts/workspace-mlp/labels.npz \
+  --out ../yumi/artifacts/workspace-mlp/model.pt
+```
+
 ---
 
 ## 4. Export to LeRobot

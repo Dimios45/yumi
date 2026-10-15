@@ -17,14 +17,23 @@ def main():
     p.add_argument('--prepared', type=Path, required=True)
     p.add_argument('--replay', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--ik', choices=replay.IK_SOLVERS, default='decoupled',
+                   help='decoupled: karma DecoupledIKSolver; mink: full-pose QP step (mink_ik.py)')
+    p.add_argument('--anchor-shift', type=float, nargs=4, metavar=('DX', 'DY', 'DZ', 'DYAW'),
+                   help="Move every episode's anchor by this base-frame shift (m, deg about base z), "
+                        'e.g. from workspace_model.py fit')
     a = p.parse_args()
     a.output.mkdir(exist_ok=False)
     summaries = []
     for path in sorted(a.prepared.glob('episode_*.json')):
         doc = json.loads(path.read_text())
         previous_report = json.loads((a.replay/path.name).read_text())
-        anchor = replay.anchor_transform(previous_report['anchor_xyz_m_yaw_deg'])
-        solver = replay.DecoupledIKSolver(mu=.005, max_dq_per_joint=replay.MAX_DQ)
+        anchor_xyz_yaw = previous_report['anchor_xyz_m_yaw_deg']
+        if a.anchor_shift:
+            from workspace_model import shifted_anchor
+            anchor_xyz_yaw = shifted_anchor(anchor_xyz_yaw, a.anchor_shift)
+        anchor = replay.anchor_transform(anchor_xyz_yaw)
+        solver = replay.make_solver(a.ik, mu=.005, max_dq_per_joint=replay.MAX_DQ)
         follower = replay.EEFollower(solver, freq=200, q_init=replay.READY, gripper_max_speed=3.)
         frames = doc['frames']
         for f in frames:
@@ -72,8 +81,8 @@ def main():
         nominal = np.arange(1,doc['horizon']+1)/doc['fps']
         doc['samples'] = [c for c in chunks if np.max(np.abs(np.asarray(c['action_time_offsets_s'])-nominal))<=.012]
         doc['ik_filter'] = {'position_threshold_m':.01,'rotation_threshold_rad':float(np.radians(5)),
-                            'max_joint_speed_rad_s':3.,'solver':'Karma DecoupledIKSolver + EEFollower, 200Hz',
-                            'anchor_xyz_m_yaw_deg':previous_report['anchor_xyz_m_yaw_deg'],
+                            'max_joint_speed_rad_s':3.,'solver':('Karma DecoupledIKSolver' if a.ik == 'decoupled' else 'MinkIKSolver')+' + EEFollower, 200Hz',
+                            'anchor_xyz_m_yaw_deg':anchor_xyz_yaw,'anchor_shift':a.anchor_shift,
                             'collision_checked':False,'registration_verified':False}
         errors = Counter(reason for f in frames for reason in set(f['reasons']))
         summary = {'episode':doc['source_episode'],'frames':len(frames),
